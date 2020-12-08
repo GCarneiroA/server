@@ -1171,7 +1171,7 @@ bool wsrep_must_sync_wait (THD* thd, uint mask)
     mysql_mutex_lock(&thd->LOCK_thd_data);
     ret= (thd->variables.wsrep_sync_wait & mask) &&
       thd->wsrep_client_thread &&
-      thd->variables.wsrep_on &&
+      WSREP_ON &&
       !(thd->variables.wsrep_dirty_reads &&
         !is_update_query(thd->lex->sql_command)) &&
       !thd->in_active_multi_stmt_transaction() &&
@@ -1259,6 +1259,51 @@ void wsrep_keys_free(wsrep_key_arr_t* key_arr)
     my_free(key_arr->keys);
     key_arr->keys= 0;
     key_arr->keys_len= 0;
+}
+
+void
+wsrep_append_fk_parent_table(THD* thd, TABLE_LIST* tables, wsrep::key_array* keys)
+{
+  if (!WSREP(thd) || !WSREP_CLIENT(thd)) return;
+    TABLE_LIST *table;
+
+    thd->release_transactional_locks();
+    uint counter;
+    MDL_savepoint mdl_savepoint= thd->mdl_context.mdl_savepoint();
+
+    if (thd->open_temporary_tables(tables) ||
+         open_tables(thd, &tables, &counter, MYSQL_OPEN_FORCE_SHARED_HIGH_PRIO_MDL))
+    {
+      WSREP_DEBUG("unable to open table for FK checks for %s", thd->query());
+    }
+
+    for (table= tables; table; table= table->next_local)
+    {
+      if (!is_temporary_table(table) && table->table)
+      {
+        FOREIGN_KEY_INFO *f_key_info;
+        List<FOREIGN_KEY_INFO> f_key_list;
+
+        table->table->file->get_foreign_key_list(thd, &f_key_list);
+        List_iterator_fast<FOREIGN_KEY_INFO> it(f_key_list);
+        while ((f_key_info=it++))
+        {
+          WSREP_DEBUG("appended fkey %s", f_key_info->referenced_table->str);
+          keys->push_back(wsrep_prepare_key_for_toi(f_key_info->referenced_db->str,
+                                                    f_key_info->referenced_table->str,
+                                                    wsrep::key::shared));
+        }
+      }
+    }
+
+    /* close the table and release MDL locks */
+    close_thread_tables(thd);
+    thd->mdl_context.rollback_to_savepoint(mdl_savepoint);
+    for (table= tables; table; table= table->next_local)
+    {
+      table->table= NULL;
+      table->mdl_request.ticket= NULL;
+    }
 }
 
 /*!
@@ -1511,10 +1556,11 @@ wsrep_prepare_keys_for_alter_add_fk(const char* child_table_db,
   return ret;
 }
 
-wsrep::key_array wsrep_prepare_keys_for_toi(const char* db,
-                                            const char* table,
-                                            const TABLE_LIST* table_list,
-                                            const Alter_info* alter_info)
+wsrep::key_array wsrep_prepare_keys_for_toi(const char *db,
+                                            const char *table,
+                                            const TABLE_LIST *table_list,
+                                            const Alter_info *alter_info,
+                                            const wsrep::key_array *fk_tables)
 {
   wsrep::key_array ret;
   if (db || table)
@@ -1534,8 +1580,13 @@ wsrep::key_array wsrep_prepare_keys_for_toi(const char* db,
       ret.insert(ret.end(), fk.begin(), fk.end());
     }
   }
+  if (fk_tables && !fk_tables->empty())
+  {
+    ret.insert(ret.end(), fk_tables->begin(), fk_tables->end());
+  }
   return ret;
 }
+
 /*
  * Construct Query_log_Event from thd query and serialize it
  * into buffer.
@@ -1927,6 +1978,14 @@ bool wsrep_can_run_in_toi(THD *thd, const char *db, const char *table,
     }
     return true;
     break;
+  case SQLCOM_DROP_TRIGGER:
+    DBUG_ASSERT(table_list);
+    if (thd->find_temporary_table(table_list))
+    {
+      return false;
+    }
+    return true;
+    break;
   case SQLCOM_ALTER_TABLE:
     if (create_info &&
         !wsrep_should_replicate_ddl(thd, create_info->db_type->db_type))
@@ -1968,7 +2027,7 @@ static int wsrep_create_sp(THD *thd, uchar** buf, size_t* buf_len)
   if (sp->m_handler->type() == SP_TYPE_FUNCTION)
   {
     sp_returns_type(thd, retstr, sp);
-    returns= retstr.lex_cstring();
+    retstr.get_value(&returns);
   }
   if (sp->m_handler->
       show_create_sp(thd, &log_query,
@@ -2061,9 +2120,10 @@ fail:
   -1: TOI replication failed
  */
 static int wsrep_TOI_begin(THD *thd, const char *db, const char *table,
-                           const TABLE_LIST* table_list,
-                           const Alter_info* alter_info,
-                           const HA_CREATE_INFO* create_info)
+                           const TABLE_LIST *table_list,
+                           const Alter_info *alter_info,
+                           const wsrep::key_array *fk_tables,
+                           const HA_CREATE_INFO *create_info)
 {
   DBUG_ASSERT(wsrep_OSU_method_get(thd) == WSREP_OSU_TOI);
 
@@ -2094,7 +2154,7 @@ static int wsrep_TOI_begin(THD *thd, const char *db, const char *table,
   struct wsrep_buf buff= { buf, buf_len };
 
   wsrep::key_array key_array=
-    wsrep_prepare_keys_for_toi(db, table, table_list, alter_info);
+    wsrep_prepare_keys_for_toi(db, table, table_list, alter_info, fk_tables);
 
   if (thd->has_read_only_protection())
   {
@@ -2242,8 +2302,9 @@ static void wsrep_RSU_end(THD *thd)
 
 int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
                              const TABLE_LIST* table_list,
-                             const Alter_info* alter_info,
-                             const HA_CREATE_INFO* create_info)
+                             const Alter_info *alter_info,
+                             const wsrep::key_array *fk_tables,
+                             const HA_CREATE_INFO *create_info)
 {
   /*
     No isolation for applier or replaying threads.
@@ -2297,7 +2358,8 @@ int wsrep_to_isolation_begin(THD *thd, const char *db_, const char *table_,
   {
     switch (wsrep_OSU_method_get(thd)) {
     case WSREP_OSU_TOI:
-      ret= wsrep_TOI_begin(thd, db_, table_, table_list, alter_info, create_info);
+      ret= wsrep_TOI_begin(thd, db_, table_, table_list, alter_info, fk_tables,
+                           create_info);
       break;
     case WSREP_OSU_RSU:
       ret= wsrep_RSU_begin(thd, db_, table_);
@@ -2867,7 +2929,14 @@ int wsrep_create_trigger_query(THD *thd, uchar** buf, size_t* buf_len)
     definer_host.length= 0;
   }
 
-  stmt_query.append(STRING_WITH_LEN("CREATE "));
+  const LEX_CSTRING command[2]=
+      {{ C_STRING_WITH_LEN("CREATE ") },
+       { C_STRING_WITH_LEN("CREATE OR REPLACE ") }};
+
+  if (thd->lex->create_info.or_replace())
+    stmt_query.append(command[1]);
+  else
+    stmt_query.append(command[0]);
 
   append_definer(thd, &stmt_query, &definer_user, &definer_host);
 

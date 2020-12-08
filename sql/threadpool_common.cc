@@ -339,6 +339,16 @@ static void handle_wait_timeout(THD *thd)
   thd->net.error= 2;
 }
 
+/** Check if some client data is cached in thd->net or thd->net.vio */
+static bool has_unread_data(THD* thd)
+{
+  NET *net= &thd->net;
+  if (net->compress && net->remain_in_buf)
+    return true;
+  Vio *vio= net->vio;
+  return vio->has_data(vio);
+}
+
 
 /**
  Process a single client request or a single batch.
@@ -376,7 +386,6 @@ static dispatch_command_return threadpool_process_request(THD *thd)
   */
   for(;;)
   {
-    Vio *vio;
     thd->net.reading_or_writing= 0;
     if (mysql_audit_release_required(thd))
       mysql_audit_release(thd);
@@ -400,8 +409,7 @@ resume:
 
     set_thd_idle(thd);
 
-    vio= thd->net.vio;
-    if (!vio->has_data(vio))
+    if (!has_unread_data(thd))
     {
       /* More info on this debug sync is in sql_parse.cc*/
       DEBUG_SYNC(thd, "before_do_command_net_read");
@@ -492,11 +500,25 @@ void tp_timeout_handler(TP_connection *c)
 {
   if (c->state != TP_STATE_IDLE)
     return;
-  THD *thd=c->thd;
+  THD *thd= c->thd;
   mysql_mutex_lock(&thd->LOCK_thd_kill);
-  thd->set_killed_no_mutex(KILL_WAIT_TIMEOUT);
-  c->priority= TP_PRIORITY_HIGH;
-  post_kill_notification(thd);
+  Vio *vio= thd->net.vio;
+  if (vio && (vio_pending(vio) > 0 || vio->has_data(vio)) &&
+      c->state == TP_STATE_IDLE)
+  {
+    /*
+     There is some data on that connection, i.e
+     i.e there was no inactivity timeout.
+     Don't kill.
+    */
+    c->state= TP_STATE_PENDING;
+  }
+  else if (c->state == TP_STATE_IDLE)
+  {
+    thd->set_killed_no_mutex(KILL_WAIT_TIMEOUT);
+    c->priority= TP_PRIORITY_HIGH;
+    post_kill_notification(thd);
+  }
   mysql_mutex_unlock(&thd->LOCK_thd_kill);
 }
 

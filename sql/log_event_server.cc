@@ -1033,6 +1033,9 @@ void Query_log_event::pack_info(Protocol *protocol)
     append_identifier(protocol->thd, &buf, db, db_len);
     buf.append(STRING_WITH_LEN("; "));
   }
+
+  DBUG_ASSERT(!flags2 || flags2_inited);
+
   if (flags2 & (OPTION_NO_FOREIGN_KEY_CHECKS | OPTION_AUTO_IS_NULL |
                 OPTION_RELAXED_UNIQUE_CHECKS |
                 OPTION_NO_CHECK_CONSTRAINT_CHECKS |
@@ -2984,10 +2987,10 @@ error:
   if (thd->transaction_rollback_request)
   {
     trans_rollback_implicit(thd);
-    thd->mdl_context.release_transactional_locks();
+    thd->release_transactional_locks();
   }
   else if (! thd->in_multi_stmt_transaction_mode())
-    thd->mdl_context.release_transactional_locks();
+    thd->release_transactional_locks();
   else
     thd->mdl_context.release_statement_locks();
 
@@ -4035,7 +4038,7 @@ int Xid_log_event::do_commit()
 {
   bool res;
   res= trans_commit(thd); /* Automatically rolls back on error. */
-  thd->mdl_context.release_transactional_locks();
+  thd->release_transactional_locks();
   return res;
 }
 #endif
@@ -4084,10 +4087,7 @@ int XA_prepare_log_event::do_commit()
     res= trans_xa_prepare(thd);
   }
   else
-  {
     res= trans_xa_commit(thd);
-    thd->mdl_context.release_transactional_locks();
-  }
 
   return res;
 }
@@ -8028,7 +8028,6 @@ end:
   if (is_table_scan || is_index_scan)
     issue_long_find_row_warning(get_general_type_code(), m_table->alias.c_ptr(), 
                                 is_index_scan, rgi);
-  table->default_column_bitmaps();
   DBUG_RETURN(error);
 }
 
@@ -8263,7 +8262,13 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
 #endif /* WSREP_PROC_INFO */
 
   thd_proc_info(thd, message);
-  int error= find_row(rgi); 
+  // Temporary fix to find out why it fails [/Matz]
+  memcpy(m_table->read_set->bitmap, m_cols.bitmap, (m_table->read_set->n_bits + 7) / 8);
+  memcpy(m_table->write_set->bitmap, m_cols_ai.bitmap, (m_table->write_set->n_bits + 7) / 8);
+
+  m_table->mark_columns_per_binlog_row_image();
+
+  int error= find_row(rgi);
   if (unlikely(error))
   {
     /*
@@ -8333,11 +8338,6 @@ Update_rows_log_event::do_exec_row(rpl_group_info *rgi)
     goto err;
   }
 
-  // Temporary fix to find out why it fails [/Matz]
-  memcpy(m_table->read_set->bitmap, m_cols.bitmap, (m_table->read_set->n_bits + 7) / 8);
-  memcpy(m_table->write_set->bitmap, m_cols_ai.bitmap, (m_table->write_set->n_bits + 7) / 8);
-
-  m_table->mark_columns_per_binlog_row_image();
   if (m_vers_from_plain && m_table->versioned(VERS_TIMESTAMP))
     m_table->vers_update_fields();
   error= m_table->file->ha_update_row(m_table->record[1], m_table->record[0]);

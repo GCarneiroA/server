@@ -49,7 +49,7 @@ struct st_spider_ft_info
   String *key;
 };
 
-class ha_spider: public handler
+class ha_spider final : public handler
 {
 public:
   SPIDER_SHARE       *share;
@@ -330,6 +330,8 @@ public:
     bool sorted
   );
   int read_range_next();
+  void reset_no_where_cond();
+  bool check_no_where_cond();
 #ifdef HA_MRR_USE_DEFAULT_IMPL
 #if defined(MARIADB_BASE_VERSION) && MYSQL_VERSION_ID >= 100000
   ha_rows multi_range_read_info_const(

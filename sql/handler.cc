@@ -804,7 +804,7 @@ int ha_end()
   DBUG_ENTER("ha_end");
 
   /* 
-    This should be eventualy based  on the graceful shutdown flag.
+    This should be eventually based on the graceful shutdown flag.
     So if flag is equal to HA_PANIC_CLOSE, the deallocate
     the errors.
   */
@@ -1536,8 +1536,8 @@ int ha_commit_trans(THD *thd, bool all)
   THD_TRANS *trans= all ? &thd->transaction->all : &thd->transaction->stmt;
   /*
     "real" is a nick name for a transaction for which a commit will
-    make persistent changes. E.g. a 'stmt' transaction inside a 'all'
-    transation is not 'real': even though it's possible to commit it,
+    make persistent changes. E.g. a 'stmt' transaction inside an 'all'
+    transaction is not 'real': even though it's possible to commit it,
     the changes are not durable as they might be rolled back if the
     enclosing 'all' transaction is rolled back.
   */
@@ -1621,16 +1621,10 @@ int ha_commit_trans(THD *thd, bool all)
   /* rw_trans is TRUE when we in a transaction changing data */
   bool rw_trans= is_real_trans &&
                  (rw_ha_count > (thd->is_current_stmt_binlog_disabled()?0U:1U));
-  MDL_request mdl_request;
-  mdl_request.ticket= 0;
+  MDL_request mdl_backup;
   DBUG_PRINT("info", ("is_real_trans: %d  rw_trans:  %d  rw_ha_count: %d",
                       is_real_trans, rw_trans, rw_ha_count));
 
-  /*
-    We need to test maria_hton because of plugin_innodb.test that changes
-    the plugin table to innodb and thus plugin_load will call
-    mysql_close_tables() which calls trans_commit_trans() with maria_hton = 0
-  */
   if (rw_trans)
   {
     /*
@@ -1641,19 +1635,23 @@ int ha_commit_trans(THD *thd, bool all)
       We allow the owner of FTWRL to COMMIT; we assume that it knows
       what it does.
     */
-    MDL_REQUEST_INIT(&mdl_request, MDL_key::BACKUP, "", "", MDL_BACKUP_COMMIT,
+    MDL_REQUEST_INIT(&mdl_backup, MDL_key::BACKUP, "", "", MDL_BACKUP_COMMIT,
                      MDL_EXPLICIT);
 
-    if (!WSREP(thd) &&
-        thd->mdl_context.acquire_lock(&mdl_request,
-                                      thd->variables.lock_wait_timeout))
+    if (!WSREP(thd))
     {
-      ha_rollback_trans(thd, all);
-      DBUG_RETURN(1);
+      if (thd->mdl_context.acquire_lock(&mdl_backup,
+                                        thd->variables.lock_wait_timeout))
+      {
+        my_error(ER_ERROR_DURING_COMMIT, MYF(0), 1);
+        ha_rollback_trans(thd, all);
+        DBUG_RETURN(1);
+      }
+      thd->backup_commit_lock= &mdl_backup;
     }
-
     DEBUG_SYNC(thd, "ha_commit_trans_after_acquire_commit_lock");
   }
+
   if (rw_trans &&
       opt_readonly &&
       !(thd->security_ctx->master_access & PRIV_IGNORE_READ_ONLY) &&
@@ -1848,13 +1846,17 @@ err:
     ha_rollback_trans(thd, all);
   else
   {
+    /*
+      We are not really doing a rollback here, but the code in trans_commit()
+      requres that m_transaction_psi is 0 when we return from this function.
+    */
     MYSQL_ROLLBACK_TRANSACTION(thd->m_transaction_psi);
     thd->m_transaction_psi= NULL;
     WSREP_DEBUG("rollback skipped %p %d",thd->rgi_slave,
                 thd->rgi_slave->is_parallel_exec);
   }
 end:
-  if (mdl_request.ticket)
+  if (mdl_backup.ticket)
   {
     /*
       We do not always immediately release transactional locks
@@ -1862,8 +1864,9 @@ end:
       thus we release the commit blocker lock as soon as it's
       not needed.
     */
-    thd->mdl_context.release_lock(mdl_request.ticket);
+    thd->mdl_context.release_lock(mdl_backup.ticket);
   }
+  thd->backup_commit_lock= 0;
 #ifdef WITH_WSREP
   if (wsrep_is_active(thd) && is_real_trans && !error &&
       (rw_ha_count == 0 || all) &&
@@ -1878,7 +1881,8 @@ end:
 
 /**
   @note
-  This function does not care about global read lock. A caller should.
+  This function does not care about global read lock or backup locks,
+  the caller should.
 
   @param[in]  all  Is set in case of explicit commit
                    (COMMIT statement), or implicit commit
@@ -1927,6 +1931,7 @@ commit_one_phase_2(THD *thd, bool all, THD_TRANS *trans, bool is_real_trans)
   DBUG_ENTER("commit_one_phase_2");
   if (is_real_trans)
     DEBUG_SYNC(thd, "commit_one_phase_2");
+
   if (ha_info)
   {
     for (; ha_info; ha_info= ha_info_next)
@@ -1955,6 +1960,7 @@ commit_one_phase_2(THD *thd, bool all, THD_TRANS *trans, bool is_real_trans)
 #endif
     }
   }
+
   /* Free resources and perform other cleanup even for 'empty' transactions. */
   if (is_real_trans)
   {
@@ -2310,7 +2316,7 @@ static my_bool xarecover_handlerton(THD *unused, plugin_ref plugin,
 
       for (int i=0; i < got; i ++)
       {
-        my_xid x= IF_WSREP(WSREP_ON && wsrep_is_wsrep_xid(&info->list[i]) ?
+        my_xid x= IF_WSREP(wsrep_is_wsrep_xid(&info->list[i]) ?
                            wsrep_xid_seqno(&info->list[i]) :
                            info->list[i].get_my_xid(),
                            info->list[i].get_my_xid());
@@ -2758,6 +2764,9 @@ int ha_delete_table(THD *thd, handlerton *hton, const char *path,
   if (hton == NULL || hton == view_pseudo_hton)
     DBUG_RETURN(0);
 
+  if (ha_check_if_updates_are_ignored(thd, hton, "DROP"))
+    DBUG_RETURN(0);
+
   error= hton->drop_table(hton, path);
   if (error > 0)
   {
@@ -2795,7 +2804,8 @@ int ha_delete_table(THD *thd, handlerton *hton, const char *path,
       error= -1;
     }
   }
-
+  if (error)
+    DBUG_PRINT("exit", ("error: %d", error));
   DBUG_RETURN(error);
 }
 
@@ -2825,7 +2835,7 @@ handler *handler::clone(const char *name, MEM_ROOT *mem_root)
 
   /*
     TODO: Implement a more efficient way to have more than one index open for
-    the same table instance. The ha_open call is not cachable for clone.
+    the same table instance. The ha_open call is not cacheable for clone.
 
     This is not critical as the engines already have the table open
     and should be able to use the original instance of the table.
@@ -3504,7 +3514,6 @@ int handler::update_auto_increment()
   THD *thd= table->in_use;
   struct system_variables *variables= &thd->variables;
   int result=0, tmp;
-  enum enum_check_fields save_count_cuted_fields;
   DBUG_ENTER("handler::update_auto_increment");
 
   /*
@@ -3646,10 +3655,10 @@ int handler::update_auto_increment()
                      nr, append ? nb_reserved_values : 0));
 
   /* Store field without warning (Warning will be printed by insert) */
-  save_count_cuted_fields= thd->count_cuted_fields;
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;
-  tmp= table->next_number_field->store((longlong)nr, TRUE);
-  thd->count_cuted_fields= save_count_cuted_fields;
+  {
+    Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
+    tmp= table->next_number_field->store((longlong)nr, TRUE);
+  }
 
   if (unlikely(tmp))                            // Out of range value in store
   {
@@ -3727,7 +3736,7 @@ int handler::update_auto_increment()
     index_init() or rnd_init() and in any column_bitmaps_signal() call after
     this.
 
-    The handler is allowd to do changes to the bitmap after a index_init or
+    The handler is allowed to do changes to the bitmap after a index_init or
     rnd_init() call is made as after this, MySQL will not use the bitmap
     for any program logic checking.
 */
@@ -3790,7 +3799,7 @@ void handler::get_auto_increment(ulonglong offset, ulonglong increment,
   {						// Autoincrement at key-start
     error= ha_index_last(table->record[1]);
     /*
-      MySQL implicitely assumes such method does locking (as MySQL decides to
+      MySQL implicitly assumes such method does locking (as MySQL decides to
       use nr+increment without checking again with the handler, in
       handler::update_auto_increment()), so reserves to infinite.
     */
@@ -5002,7 +5011,8 @@ static my_bool delete_table_force(THD *thd, plugin_ref plugin, void *arg)
   handlerton *hton = plugin_hton(plugin);
   st_force_drop_table_params *param = (st_force_drop_table_params *)arg;
 
-  if (param->discovering == (hton->discover_table != NULL))
+  if (param->discovering == (hton->discover_table != NULL) &&
+      !(thd->slave_thread && (hton->flags & HTON_IGNORE_UPDATES)))
   {
     int error;
     error= ha_delete_table(thd, hton, param->path, param->db, param->alias, 0);
@@ -6312,6 +6322,7 @@ extern "C" check_result_t handler_index_cond_check(void* h_arg)
   THD *thd= h->table->in_use;
   check_result_t res;
 
+  DEBUG_SYNC(thd, "handler_index_cond_check");
   enum thd_kill_levels abort_at= h->has_rollback() ?
     THD_ABORT_SOFTLY : THD_ABORT_ASAP;
   if (thd_kill_level(thd) > abort_at)
@@ -6345,6 +6356,7 @@ check_result_t handler_rowid_filter_check(void *h_arg)
   if (!h->pushed_idx_cond)
   {
     THD *thd= h->table->in_use;
+    DEBUG_SYNC(thd, "handler_rowid_filter_check");
     enum thd_kill_levels abort_at= h->has_transactions() ?
       THD_ABORT_SOFTLY : THD_ABORT_ASAP;
     if (thd_kill_level(thd) > abort_at)
@@ -6808,7 +6820,7 @@ int handler::check_duplicate_long_entry_key(const uchar *new_rec, uint key_no)
           DBUG_ASSERT(fnc->arguments()[0]->type() == Item::FIELD_ITEM);
           t_field= static_cast<Item_field *>(fnc->arguments()[0])->field;
           uint length= (uint)fnc->arguments()[1]->val_int();
-          if (t_field->cmp_max(t_field->ptr, t_field->ptr + diff, length))
+          if (t_field->cmp_prefix(t_field->ptr, t_field->ptr + diff, length))
             is_same= false;
         }
       }
@@ -6934,7 +6946,7 @@ int handler::ha_check_overlaps(const uchar *old_data, const uchar* new_data)
   uchar *record_buffer= lookup_buffer + table_share->max_unique_length
                                       + table_share->null_fields;
 
-  // Needs to compare record refs later is old_row_found()
+  // Needed to compare record refs later
   if (is_update)
     position(old_data);
 
@@ -6990,12 +7002,8 @@ int handler::ha_check_overlaps(const uchar *old_data, const uchar* new_data)
       /* In case of update it could happen that the nearest neighbour is
          a record we are updating. It means, that there are no overlaps
          from this side.
-
-         An assumption is made that during update we always have the last
-         fetched row in old_data. Therefore, comparing ref's is enough
       */
       DBUG_ASSERT(lookup_handler != this);
-      DBUG_ASSERT(inited != NONE);
       DBUG_ASSERT(ref_length == lookup_handler->ref_length);
 
       lookup_handler->position(record_buffer);
@@ -7120,16 +7128,17 @@ int handler::ha_write_row(const uchar *buf)
   if ((error= ha_check_overlaps(NULL, buf)))
     DBUG_RETURN(error);
 
-  MYSQL_INSERT_ROW_START(table_share->db.str, table_share->table_name.str);
-  mark_trx_read_write();
-  increment_statistics(&SSV::ha_write_count);
-
   if (table->s->long_unique_table && this == table->file)
   {
     DBUG_ASSERT(inited == NONE || lookup_handler != this);
     if ((error= check_duplicate_long_entries(buf)))
       DBUG_RETURN(error);
   }
+
+  MYSQL_INSERT_ROW_START(table_share->db.str, table_share->table_name.str);
+  mark_trx_read_write();
+  increment_statistics(&SSV::ha_write_count);
+
   TABLE_IO_WAIT(tracker, PSI_TABLE_WRITE_ROW, MAX_KEY, error,
                       { error= write_row(buf); })
 
@@ -7169,17 +7178,19 @@ int handler::ha_update_row(const uchar *old_data, const uchar *new_data)
   DBUG_ASSERT(new_data == table->record[0]);
   DBUG_ASSERT(old_data == table->record[1]);
 
-  if ((error= ha_check_overlaps(old_data, new_data)))
+  uint saved_status= table->status;
+  error= ha_check_overlaps(old_data, new_data);
+
+  if (!error && table->s->long_unique_table && this == table->file)
+    error= check_duplicate_long_entries_update(new_data);
+  table->status= saved_status;
+
+  if (error)
     return error;
 
   MYSQL_UPDATE_ROW_START(table_share->db.str, table_share->table_name.str);
   mark_trx_read_write();
   increment_statistics(&SSV::ha_update_count);
-  if (table->s->long_unique_table && this == table->file &&
-      (error= check_duplicate_long_entries_update(new_data)))
-  {
-    return error;
-  }
 
   TABLE_IO_WAIT(tracker, PSI_TABLE_UPDATE_ROW, active_index, 0,
                       { error= update_row(old_data, new_data);})
@@ -8071,6 +8082,8 @@ Vers_parse_info::fix_create_like(Alter_info &alter_info, HA_CREATE_INFO &create_
                                  TABLE_LIST &src_table, TABLE_LIST &table)
 {
   List_iterator<Create_field> it(alter_info.create_list);
+  List_iterator<Key> key_it(alter_info.key_list);
+  List_iterator<Key_part_spec> kp_it;
   Create_field *f, *f_start=NULL, *f_end= NULL;
 
   DBUG_ASSERT(alter_info.create_list.elements > 2);
@@ -8084,6 +8097,23 @@ Vers_parse_info::fix_create_like(Alter_info &alter_info, HA_CREATE_INFO &create_
       {
         it.remove();
         remove--;
+      }
+      key_it.rewind();
+      while (Key *key= key_it++)
+      {
+        kp_it.init(key->columns);
+        while (Key_part_spec *kp= kp_it++)
+        {
+          if (0 == lex_string_cmp(system_charset_info, &kp->field_name,
+                                  &f->field_name))
+          {
+            kp_it.remove();
+          }
+        }
+        if (0 == key->columns.elements)
+        {
+          key_it.remove();
+        }
       }
     }
     DBUG_ASSERT(remove == 0);
@@ -8302,6 +8332,7 @@ bool Table_period_info::check_field(const Create_field* f,
   {
     my_error(ER_PERIOD_FIELD_WRONG_ATTRIBUTES, MYF(0),
              f->field_name.str, "GENERATED ALWAYS AS");
+    res= true;
   }
 
   return res;

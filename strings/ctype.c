@@ -36,6 +36,12 @@
   
 */
 
+const char charset_name_latin2[]= "latin2";
+const char charset_name_utf8[]= "utf8";
+const char charset_name_utf16[]= "utf16";
+const char charset_name_utf32[]= "utf32";
+const char charset_name_ucs2[]= "ucs2";
+const char charset_name_utf8mb4[]= "utf8mb4";
 
 /*
   Avoid using my_snprintf
@@ -915,7 +921,7 @@ my_string_metadata_get(MY_STRING_METADATA *metadata,
 /*
   Check repertoire: detect pure ascii strings
 */
-uint
+my_repertoire_t
 my_string_repertoire(CHARSET_INFO *cs, const char *str, size_t length)
 {
   if (cs->mbminlen == 1 && !(cs->state & MY_CS_NONASCII))
@@ -942,7 +948,7 @@ my_string_repertoire(CHARSET_INFO *cs, const char *str, size_t length)
 /*
   Returns repertoire for charset
 */
-uint my_charset_repertoire(CHARSET_INFO *cs)
+my_repertoire_t my_charset_repertoire(CHARSET_INFO *cs)
 {
   return cs->state & MY_CS_PUREASCII ?
     MY_REPERTOIRE_ASCII : MY_REPERTOIRE_UNICODE30;

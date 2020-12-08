@@ -374,7 +374,7 @@ class Dec_ptr_and_buffer: public Dec_ptr
 protected:
   my_decimal m_buffer;
 public:
-  int round_to(my_decimal *to, uint scale, decimal_round_mode mode)
+  int round_to(my_decimal *to, int scale, decimal_round_mode mode)
   {
     DBUG_ASSERT(m_ptr);
     return m_ptr->round_to(to, scale, mode);
@@ -382,6 +382,14 @@ public:
   int round_self(uint scale, decimal_round_mode mode)
   {
     return round_to(&m_buffer, scale, mode);
+  }
+  int round_self_if_needed(int scale, decimal_round_mode mode)
+  {
+    if (scale >= m_ptr->frac)
+      return E_DEC_OK;
+    int res= m_ptr->round_to(&m_buffer, scale, mode);
+    m_ptr= &m_buffer;
+    return res;
   }
   String *to_string_round(String *to, uint dec)
   {
@@ -807,34 +815,39 @@ public:
   public:
     void push_conversion_warnings(THD *thd, bool totally_useless_value,
                                   date_mode_t mode, timestamp_type tstype,
-                                  const TABLE_SHARE* s, const char *name)
+                                  const char *db_name, const char *table_name,
+                                  const char *name)
     {
       const char *typestr= tstype >= 0 ? type_name_by_timestamp_type(tstype) :
                            mode & (TIME_INTERVAL_hhmmssff | TIME_INTERVAL_DAY) ?
                            "interval" :
                            mode & TIME_TIME_ONLY ? "time" : "datetime";
       Temporal::push_conversion_warnings(thd, totally_useless_value, warnings,
-                                         typestr, s, name, ptr());
+                                         typestr, db_name, table_name, name,
+                                         ptr());
     }
   };
 
   class Warn_push: public Warn
   {
-    THD *m_thd;
-    const TABLE_SHARE *m_s;
-    const char *m_name;
-    const MYSQL_TIME *m_ltime;
-    date_mode_t m_mode;
+    THD * const m_thd;
+    const char * const m_db_name;
+    const char * const m_table_name;
+    const char * const m_name;
+    const MYSQL_TIME * const m_ltime;
+    const date_mode_t m_mode;
   public:
-    Warn_push(THD *thd, const TABLE_SHARE *s, const char *name,
-              const MYSQL_TIME *ltime, date_mode_t mode)
-    :m_thd(thd), m_s(s), m_name(name), m_ltime(ltime), m_mode(mode)
+    Warn_push(THD *thd, const char *db_name, const char *table_name,
+              const char *name, const MYSQL_TIME *ltime, date_mode_t mode)
+      : m_thd(thd), m_db_name(db_name), m_table_name(table_name), m_name(name),
+        m_ltime(ltime), m_mode(mode)
     { }
     ~Warn_push()
     {
       if (warnings)
         push_conversion_warnings(m_thd, m_ltime->time_type < 0,
-                                 m_mode, m_ltime->time_type, m_s, m_name);
+                                 m_mode, m_ltime->time_type,
+                                 m_db_name, m_table_name, m_name);
     }
   };
 
@@ -875,7 +888,8 @@ public:
   }
   static void push_conversion_warnings(THD *thd, bool totally_useless_value, int warn,
                                        const char *type_name,
-                                       const TABLE_SHARE *s,
+                                       const char *db_name,
+                                       const char *table_name,
                                        const char *field_name,
                                        const char *value);
   /*
@@ -1195,6 +1209,13 @@ public:
   }
   // End of constuctors
 
+  bool copy_valid_value_to_mysql_time(MYSQL_TIME *ltime) const
+  {
+    DBUG_ASSERT(is_valid_temporal());
+    *ltime= *this;
+    return false;
+  }
+
   longlong to_longlong() const
   {
     if (!is_valid_temporal())
@@ -1424,6 +1445,8 @@ public:
   }
 };
 
+class Schema;
+
 
 /**
   Class Time is designed to store valid TIME values.
@@ -1445,6 +1468,7 @@ public:
 */
 class Time: public Temporal
 {
+  static uint binary_length_to_precision(uint length);
 public:
   enum datetime_to_time_mode_t
   {
@@ -1503,6 +1527,14 @@ public:
     { }
   };
 
+  class Options_for_round: public Options
+  {
+  public:
+    Options_for_round(time_round_mode_t round_mode= TIME_FRAC_TRUNCATE)
+     :Options(Time::default_flags_for_get_date(), round_mode,
+              Time::DATETIME_TO_TIME_DISALLOW)
+    { }
+  };
   class Options_cmp: public Options
   {
   public:
@@ -1669,6 +1701,14 @@ public:
   */
   Time(int *warn, bool neg, ulonglong hour, uint minute, const Sec6 &second);
   Time() { time_type= MYSQL_TIMESTAMP_NONE; }
+  Time(const Native &native);
+  Time(THD *thd, const MYSQL_TIME *ltime, const Options opt)
+  {
+    *(static_cast<MYSQL_TIME*>(this))= *ltime;
+    DBUG_ASSERT(is_valid_temporal());
+    int warn= 0;
+    valid_MYSQL_TIME_to_valid_value(thd, &warn, opt);
+  }
   Time(Item *item)
    :Time(current_thd, item)
   { }
@@ -1824,6 +1864,7 @@ public:
     return !is_valid_time() ? 0 :
            Temporal::to_double(neg, TIME_to_ulonglong_time(this), second_part);
   }
+  bool to_native(Native *to, uint decimals) const;
   String *to_string(String *str, uint dec) const
   {
     if (!is_valid_time())
@@ -1841,6 +1882,11 @@ public:
   {
     return is_valid_time() ? Temporal::to_packed() : 0;
   }
+  longlong valid_time_to_packed() const
+  {
+    DBUG_ASSERT(is_valid_time_slow());
+    return Temporal::to_packed();
+  }
   long fraction_remainder(uint dec) const
   {
     DBUG_ASSERT(is_valid_time());
@@ -1853,6 +1899,40 @@ public:
       my_time_trunc(this, dec);
     DBUG_ASSERT(is_valid_value_slow());
     return *this;
+  }
+  Time &ceiling(int *warn)
+  {
+    if (is_valid_time())
+    {
+      if (neg)
+        my_time_trunc(this, 0);
+      else if (second_part)
+        round_or_set_max(0, warn, 999999999);
+    }
+    DBUG_ASSERT(is_valid_value_slow());
+    return *this;
+  }
+  Time &ceiling()
+  {
+    int warn= 0;
+    return ceiling(&warn);
+  }
+  Time &floor(int *warn)
+  {
+    if (is_valid_time())
+    {
+      if (!neg)
+        my_time_trunc(this, 0);
+      else if (second_part)
+        round_or_set_max(0, warn, 999999999);
+    }
+    DBUG_ASSERT(is_valid_value_slow());
+    return *this;
+  }
+  Time &floor()
+  {
+    int warn= 0;
+    return floor(&warn);
   }
   Time &round(uint dec, int *warn)
   {
@@ -1981,6 +2061,11 @@ public:
   {
     return ::check_date_with_warn(thd, this, flags, MYSQL_TIMESTAMP_ERROR);
   }
+  bool check_date_with_warn(THD *thd)
+  {
+    return ::check_date_with_warn(thd, this, Temporal::sql_mode_for_dates(thd),
+                                  MYSQL_TIMESTAMP_ERROR);
+  }
   static date_conv_mode_t comparison_flags_for_get_date()
   { return TIME_INVALID_DATES | TIME_FUZZY_DATES; }
 };
@@ -2049,10 +2134,36 @@ public:
     datetime_to_date(this);
     DBUG_ASSERT(is_valid_date_slow());
   }
+  explicit Date(const Temporal_hybrid *from)
+  {
+    from->copy_valid_value_to_mysql_time(this);
+    DBUG_ASSERT(is_valid_date_slow());
+  }
   bool is_valid_date() const
   {
     DBUG_ASSERT(is_valid_value_slow());
     return time_type == MYSQL_TIMESTAMP_DATE;
+  }
+  bool check_date(date_conv_mode_t flags, int *warnings) const
+  {
+    DBUG_ASSERT(is_valid_date_slow());
+    return ::check_date(this, (year || month || day),
+                        ulonglong(flags & TIME_MODE_FOR_XXX_TO_DATE),
+                        warnings);
+  }
+  bool check_date(THD *thd, int *warnings) const
+  {
+    return check_date(Temporal::sql_mode_for_dates(thd), warnings);
+  }
+  bool check_date(date_conv_mode_t flags) const
+  {
+    int dummy; /* unused */
+    return check_date(flags, &dummy);
+  }
+  bool check_date(THD *thd) const
+  {
+    int dummy;
+    return check_date(Temporal::sql_mode_for_dates(thd), &dummy);
   }
   const MYSQL_TIME *get_mysql_time() const
   {
@@ -2096,6 +2207,11 @@ public:
     return Temporal_with_date::yearweek(week_behaviour);
   }
 
+  longlong valid_date_to_packed() const
+  {
+    DBUG_ASSERT(is_valid_date_slow());
+    return Temporal::to_packed();
+  }
   longlong to_longlong() const
   {
     return is_valid_date() ? (longlong) TIME_to_ulonglong_date(this) : 0LL;
@@ -2282,6 +2398,16 @@ public:
   {
     round(thd, dec, time_round_mode_t(fuzzydate), warn);
   }
+  explicit Datetime(const Temporal_hybrid *from)
+  {
+    from->copy_valid_value_to_mysql_time(this);
+    DBUG_ASSERT(is_valid_datetime_slow());
+  }
+  explicit Datetime(const MYSQL_TIME *from)
+  {
+    *(static_cast<MYSQL_TIME*>(this))= *from;
+    DBUG_ASSERT(is_valid_datetime_slow());
+  }
 
   bool is_valid_datetime() const
   {
@@ -2303,6 +2429,10 @@ public:
   {
     int dummy; /* unused */
     return check_date(flags, &dummy);
+  }
+  bool check_date(THD *thd) const
+  {
+    return check_date(Temporal::sql_mode_for_dates(thd));
   }
   bool hhmmssff_is_zero() const
   {
@@ -2412,6 +2542,11 @@ public:
   {
     return is_valid_datetime() ? Temporal::to_packed() : 0;
   }
+  longlong valid_datetime_to_packed() const
+  {
+    DBUG_ASSERT(is_valid_datetime_slow());
+    return Temporal::to_packed();
+  }
   long fraction_remainder(uint dec) const
   {
     DBUG_ASSERT(is_valid_datetime());
@@ -2421,9 +2556,21 @@ public:
   Datetime &trunc(uint dec)
   {
     if (is_valid_datetime())
-      my_time_trunc(this, dec);
+      my_datetime_trunc(this, dec);
     DBUG_ASSERT(is_valid_value_slow());
     return *this;
+  }
+  Datetime &ceiling(THD *thd, int *warn)
+  {
+    if (is_valid_datetime() && second_part)
+      round_or_invalidate(thd, 0, warn, 999999999);
+    DBUG_ASSERT(is_valid_value_slow());
+    return *this;
+  }
+  Datetime &ceiling(THD *thd)
+  {
+    int warn= 0;
+    return ceiling(thd, &warn);
   }
   Datetime &round(THD *thd, uint dec, int *warn)
   {
@@ -2712,6 +2859,19 @@ public:
 #define MY_REPERTOIRE_NUMERIC   MY_REPERTOIRE_ASCII
 
 
+static inline my_repertoire_t operator|(const my_repertoire_t a,
+                                        const my_repertoire_t b)
+{
+  return (my_repertoire_t) ((uint) a | (uint) b);
+}
+
+static inline my_repertoire_t &operator|=(my_repertoire_t &a,
+                                          const my_repertoire_t b)
+{
+  return a= (my_repertoire_t) ((uint) a | (uint) b);
+}
+
+
 enum Derivation
 {
   DERIVATION_IGNORABLE= 6,
@@ -2733,7 +2893,7 @@ class DTCollation {
 public:
   CHARSET_INFO     *collation;
   enum Derivation derivation;
-  uint repertoire;
+  my_repertoire_t repertoire;
 
   void set_repertoire_from_charset(CHARSET_INFO *cs)
   {
@@ -2769,7 +2929,7 @@ public:
   }
   DTCollation(CHARSET_INFO *collation_arg,
               Derivation derivation_arg,
-              uint repertoire_arg)
+              my_repertoire_t repertoire_arg)
    :collation(collation_arg),
     derivation(derivation_arg),
     repertoire(repertoire_arg)
@@ -2786,7 +2946,7 @@ public:
   }
   void set(CHARSET_INFO *collation_arg,
            Derivation derivation_arg,
-           uint repertoire_arg)
+           my_repertoire_t repertoire_arg)
   {
     collation= collation_arg;
     derivation= derivation_arg;
@@ -3434,6 +3594,7 @@ public:
   static const
   Type_handler *aggregate_for_result_traditional(const Type_handler *h1,
                                                  const Type_handler *h2);
+  virtual Schema *schema() const;
   static void partition_field_type_not_allowed(const LEX_CSTRING &field_name);
   static bool partition_field_check_result_type(Item *item,
                                                 Item_result expected_type);
@@ -3781,8 +3942,7 @@ public:
   virtual Field *make_schema_field(MEM_ROOT *root,
                                    TABLE *table,
                                    const Record_addr &addr,
-                                   const ST_FIELD_INFO &def,
-                                   bool show_field) const
+                                   const ST_FIELD_INFO &def) const
   {
     DBUG_ASSERT(0);
     return NULL;
@@ -3826,7 +3986,6 @@ public:
                           const Type_std_attributes *item,
                           SORT_FIELD_ATTR *attr) const= 0;
   virtual bool is_packable() const { return false; }
-
 
   virtual uint32 max_display_length(const Item *item) const= 0;
   virtual uint32 Item_decimal_notation_int_digits(const Item *item) const { return 0; }
@@ -3890,9 +4049,21 @@ public:
                                Item *target_expr, Item *target_value,
                                Item_bool_func2 *source,
                                Item *source_expr, Item *source_const) const= 0;
+
+  /*
+    @brief
+      Check if an IN subquery allows materialization or not
+    @param
+      inner              expression on the inner side of the IN subquery
+      outer              expression on the outer side of the IN subquery
+      is_in_predicate    SET to true if IN subquery was converted from an
+                         IN predicate or we are checking if materialization
+                         strategy can be used for an IN predicate
+  */
   virtual bool
   subquery_type_allows_materialization(const Item *inner,
-                                       const Item *outer) const= 0;
+                                       const Item *outer,
+                                       bool is_in_predicate) const= 0;
   /**
     Make a simple constant replacement item for a constant "src",
     so the new item can futher be used for comparison with "cmp", e.g.:
@@ -4152,8 +4323,8 @@ public:
     DBUG_ASSERT(0);
     return 0;
   }
-  bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override
+  bool subquery_type_allows_materialization(const Item *, const Item *,
+                                            bool) const override
   {
     DBUG_ASSERT(0);
     return false;
@@ -4555,7 +4726,8 @@ public:
   int stored_field_cmp_to_item(THD *thd, Field *field, Item *item)
                                const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer)
+                                            const Item *outer,
+                                            bool is_in_predicate)
                                             const override;
   void make_sort_key_part(uchar *to, Item *item,
                           const SORT_FIELD_ATTR *sort_field,
@@ -4660,12 +4832,13 @@ public:
     return item_val.is_null() ? 0 : my_decimal(field).cmp(item_val.ptr());
   }
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_num_distinct_aggregator_field(MEM_ROOT *, const Item *)
     const override;
   void make_sort_key_part(uchar *to, Item *item,
@@ -4915,7 +5088,9 @@ public:
   const Type_handler *type_handler_for_comparison() const override;
   int stored_field_cmp_to_item(THD *thd, Field *field, Item *item) const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Field *make_num_distinct_aggregator_field(MEM_ROOT *, const Item *) const override;
   Field *make_table_field(MEM_ROOT *root,
                           const LEX_CSTRING *name,
@@ -5056,7 +5231,9 @@ public:
                                    Item *source_expr, Item *source_const)
     const override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   bool Item_func_min_max_fix_attributes(THD *thd, Item_func_min_max *func,
                                         Item **items, uint nitems)
     const override;
@@ -5089,8 +5266,6 @@ public:
   bool Item_func_between_fix_length_and_dec(Item_func_between *)const override;
   bool Item_func_in_fix_comparator_compatible_types(THD *, Item_func_in *)
     const override;
-  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
-  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val *)const override;
   bool Item_func_abs_fix_length_and_dec(Item_func_abs *) const override;
   bool Item_func_neg_fix_length_and_dec(Item_func_neg *) const override;
   bool Item_func_plus_fix_length_and_dec(Item_func_plus *) const override;
@@ -5098,7 +5273,7 @@ public:
   bool Item_func_mul_fix_length_and_dec(Item_func_mul *) const override;
   bool Item_func_div_fix_length_and_dec(Item_func_div *) const override;
   bool Item_func_mod_fix_length_and_dec(Item_func_mod *) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -5135,7 +5310,7 @@ public:
   void sort_length(THD *thd,
                    const Type_std_attributes *item,
                    SORT_FIELD_ATTR *attr) const override;
-  bool is_packable()const override { return true; }
+  bool is_packable() const override { return true; }
   bool union_element_finalize(const Item * item) const override;
   uint calc_key_length(const Column_definition &def) const override;
   bool Column_definition_prepare_stage1(THD *thd,
@@ -5196,7 +5371,9 @@ public:
                                    Item *source_expr, Item *source_const) const
     override;
   bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override;
+                                            const Item *outer,
+                                            bool is_in_predicate)
+    const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp) const
     override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
@@ -5265,7 +5442,7 @@ public:
   bool Item_func_mul_fix_length_and_dec(Item_func_mul *) const override;
   bool Item_func_div_fix_length_and_dec(Item_func_div *) const override;
   bool Item_func_mod_fix_length_and_dec(Item_func_mod *) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -5326,8 +5503,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5378,8 +5554,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5430,8 +5605,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5497,8 +5671,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5616,6 +5789,8 @@ public:
                                    const Column_definition_attributes *attr,
                                    uint32 flags) const override;
   Item_cache *Item_get_cache(THD *thd, const Item *item) const override;
+  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val *)const override;
   void Item_get_date(THD *thd, Item *item, Temporal::Warn *warn,
                      MYSQL_TIME *ltime,  date_mode_t fuzzydate) const override;
   void Item_func_hybrid_field_type_get_date(THD *,
@@ -5640,7 +5815,7 @@ public:
   }
   uint32 max_display_length(const Item *item) const override;
   uint32 Item_decimal_notation_int_digits(const Item *item) const override;
-  static uint32 Bit_decimal_notation_int_digits(const Item *item); 
+  static uint32 Bit_decimal_notation_int_digits_by_nbits(uint nbits);
   uint32 max_display_length_for_field(const Conv_source &src) const override;
   uint32 calc_pack_length(uint32 length) const override { return length / 8; }
   uint calc_key_length(const Column_definition &def) const override;
@@ -5657,6 +5832,8 @@ public:
   }
   void show_binlog_type(const Conv_source &src, const Field &, String *str)
     const override;
+  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   Field *make_conversion_table_field(MEM_ROOT *root,
                                      TABLE *table, uint metadata,
                                      const Field *target) const override;
@@ -5724,8 +5901,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5780,8 +5956,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -5819,6 +5994,15 @@ public:
   {
     return MYSQL_TIMESTAMP_TIME;
   }
+  bool is_val_native_ready() const override { return true; }
+  const Type_handler *type_handler_for_native_format() const override;
+  int cmp_native(const Native &a, const Native &b) const override;
+  bool Item_val_native_with_conversion(THD *thd, Item *, Native *to)
+                                       const override;
+  bool Item_val_native_with_conversion_result(THD *thd, Item *, Native *to)
+                                              const override;
+  bool Item_param_val_native(THD *thd, Item_param *item, Native *to)
+                             const override;
   bool partition_field_check(const LEX_CSTRING &field_name,
                              Item *item_expr) const override
   {
@@ -5827,8 +6011,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item_literal *create_literal_item(THD *thd, const char *str, size_t length,
                                     CHARSET_INFO *cs, bool send_error)
                                     const override;
@@ -5899,6 +6082,7 @@ public:
                                   const override;
   longlong Item_func_between_val_int(Item_func_between *func) const override;
   bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   Item *make_const_item_for_comparison(THD *, Item *src, const Item *cmp)
                                        const override;
   bool set_comparator_func(Arg_comparator *cmp) const override;
@@ -6037,8 +6221,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item_literal *create_literal_item(THD *thd, const char *str, size_t length,
                                     CHARSET_INFO *cs, bool send_error)
                                     const override;
@@ -6060,12 +6243,17 @@ public:
   longlong Item_func_min_max_val_int(Item_func_min_max *) const override;
   my_decimal *Item_func_min_max_val_decimal(Item_func_min_max *,
                                             my_decimal *) const override;
+  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
                                        const char *name,
                                        Type_handler_hybrid_field_type *,
                                        Type_all_attributes *atrr,
-                                       Item **items, uint nitems)
-                                       const override;
+                                       Item **items, uint nitems) const
+    override;
+  bool Item_func_min_max_fix_attributes(THD *thd, Item_func_min_max *func,
+                                        Item **items, uint nitems) const
+    override;
   void Item_param_set_param_func(Item_param *param,
                                  uchar **pos, ulong len) const override;
 };
@@ -6163,8 +6351,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Item *create_typecast_item(THD *thd, Item *item,
                              const Type_cast_attributes &attr) const override;
   bool validate_implicit_default_value(THD *thd, const Column_definition &def)
@@ -6195,6 +6382,7 @@ public:
   String *Item_func_min_max_val_str(Item_func_min_max *, String *) const override;
   double Item_func_min_max_val_real(Item_func_min_max *) const override;
   longlong Item_func_min_max_val_int(Item_func_min_max *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   my_decimal *Item_func_min_max_val_decimal(Item_func_min_max *, my_decimal *)
                                             const override;
   bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
@@ -6324,6 +6512,7 @@ public:
   int cmp_native(const Native &a, const Native &b) const override;
   longlong Item_func_between_val_int(Item_func_between *func) const override;
   bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   cmp_item *make_cmp_item(THD *thd, CHARSET_INFO *cs) const override;
   in_vector *make_in_vector(THD *thd, const Item_func_in *f, uint nargs)
                             const override;
@@ -6372,6 +6561,12 @@ public:
   bool Item_func_min_max_get_date(THD *thd, Item_func_min_max*,
                                   MYSQL_TIME *, date_mode_t fuzzydate)
                                   const override;
+  bool Column_definition_set_attributes(THD *thd,
+                                        Column_definition *def,
+                                        const Lex_field_type_st &attr,
+                                        CHARSET_INFO *cs,
+                                        column_definition_type_t type)
+                                        const override;
 };
 
 
@@ -6731,8 +6926,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -6749,6 +6943,8 @@ class Type_handler_hex_hybrid: public Type_handler_varchar
 public:
   virtual ~Type_handler_hex_hybrid() {}
   const Type_handler *cast_to_int_type_handler() const override;
+  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
 };
 
 
@@ -6808,8 +7004,8 @@ public:
   {
     return blob_type_handler(item);
   }
-  bool subquery_type_allows_materialization(const Item *inner,
-                                            const Item *outer) const override
+  bool subquery_type_allows_materialization(const Item *, const Item *, bool)
+    const override
   {
     return false; // Materialization does not work with BLOB columns
   }
@@ -6850,8 +7046,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
   Field *make_table_field_from_def(TABLE_SHARE *share,
                                    MEM_ROOT *mem_root,
                                    const LEX_CSTRING *name,
@@ -6859,7 +7054,7 @@ public:
                                    const Bit_addr &bit,
                                    const Column_definition_attributes *attr,
                                    uint32 flags) const override;
-  const Vers_type_handler *vers() const override { return &vers_type_timestamp; }
+  const Vers_type_handler *vers() const override;
 };
 
 
@@ -6940,7 +7135,7 @@ public:
   {
     return MYSQL_TYPE_BLOB_COMPRESSED;
   }
-  ulong KEY_pack_flags(uint column_nr) const override
+  ulong KEY_pack_flags(uint) const override
   {
     DBUG_ASSERT(0);
     return 0;
@@ -6951,7 +7146,7 @@ public:
   Field *make_conversion_table_field(MEM_ROOT *root,
                                      TABLE *table, uint metadata,
                                      const Field *target) const override;
-  enum_dynamic_column_type dyncol_type(const Type_all_attributes *attr)
+  enum_dynamic_column_type dyncol_type(const Type_all_attributes *)
                                        const override
   {
     DBUG_ASSERT(0);
@@ -6967,6 +7162,8 @@ public:
   enum_field_types field_type() const override { return MYSQL_TYPE_STRING; }
   const Type_handler *type_handler_for_item_field() const override;
   const Type_handler *cast_to_int_type_handler() const override;
+  bool Item_func_round_fix_length_and_dec(Item_func_round *) const override;
+  bool Item_func_int_val_fix_length_and_dec(Item_func_int_val*) const override;
   uint32 max_display_length_for_field(const Conv_source &src) const override;
   bool Item_hybrid_func_fix_attributes(THD *thd,
                                        const char *name,
@@ -7032,8 +7229,7 @@ public:
   Field *make_schema_field(MEM_ROOT *root,
                            TABLE *table,
                            const Record_addr &addr,
-                           const ST_FIELD_INFO &def,
-                           bool show_field) const override;
+                           const ST_FIELD_INFO &def) const override;
 };
 
 

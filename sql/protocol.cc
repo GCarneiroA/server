@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2012, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2012, Monty Program Ab
+   Copyright (c) 2008, 2020, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -32,16 +32,15 @@
 #include <stdarg.h>
 
 static const unsigned int PACKET_BUFFER_EXTRA_ALLOC= 1024;
-/* Declared non-static only because of the embedded library. */
-bool net_send_error_packet(THD *, uint, const char *, const char *);
-/* Declared non-static only because of the embedded library. */
-bool net_send_ok(THD *, uint, uint, ulonglong, ulonglong, const char *,
-                 bool);
-/* Declared non-static only because of the embedded library. */
-bool net_send_eof(THD *thd, uint server_status, uint statement_warn_count);
 #ifndef EMBEDDED_LIBRARY
 static bool write_eof_packet(THD *, NET *, uint, uint);
 #endif
+
+CHARSET_INFO *Protocol::character_set_results() const
+{
+  return thd->variables.character_set_results;
+}
+
 
 #ifndef EMBEDDED_LIBRARY
 bool Protocol::net_store_data(const uchar *from, size_t length)
@@ -58,7 +57,8 @@ bool Protocol_binary::net_store_data(const uchar *from, size_t length)
       packet->realloc(packet_length+9+length))
     return 1;
   uchar *to= net_store_length((uchar*) packet->ptr()+packet_length, length);
-  memcpy(to,from,length);
+  if (length)
+    memcpy(to,from,length);
   packet->length((uint) (to+length-(uchar*) packet->ptr()));
   return 0;
 }
@@ -146,11 +146,11 @@ bool Protocol_binary::net_store_data_cs(const uchar *from, size_t length,
     @retval TRUE An error occurred and the message wasn't sent properly
 */
 
-bool net_send_error(THD *thd, uint sql_errno, const char *err,
-                    const char* sqlstate)
+bool Protocol::net_send_error(THD *thd, uint sql_errno, const char *err,
+                              const char* sqlstate)
 {
   bool error;
-  DBUG_ENTER("net_send_error");
+  DBUG_ENTER("Protocol::net_send_error");
 
   DBUG_ASSERT(!thd->spcont);
   DBUG_ASSERT(sql_errno);
@@ -208,10 +208,10 @@ bool net_send_error(THD *thd, uint sql_errno, const char *err,
 
 #ifndef EMBEDDED_LIBRARY
 bool
-net_send_ok(THD *thd,
-            uint server_status, uint statement_warn_count,
-            ulonglong affected_rows, ulonglong id, const char *message,
-            bool is_eof)
+Protocol::net_send_ok(THD *thd,
+                      uint server_status, uint statement_warn_count,
+                      ulonglong affected_rows, ulonglong id,
+                      const char *message, bool is_eof)
 {
   NET *net= &thd->net;
   StringBuffer<MYSQL_ERRMSG_SIZE + 10> store;
@@ -219,7 +219,7 @@ net_send_ok(THD *thd,
   bool state_changed= false;
 
   bool error= FALSE;
-  DBUG_ENTER("net_send_ok");
+  DBUG_ENTER("Protocol::net_send_ok");
 
   if (! net->vio)	// hack for re-parsing queries
   {
@@ -322,11 +322,11 @@ static uchar eof_buff[1]= { (uchar) 254 };      /* Marker for end of fields */
 */    
 
 bool
-net_send_eof(THD *thd, uint server_status, uint statement_warn_count)
+Protocol::net_send_eof(THD *thd, uint server_status, uint statement_warn_count)
 {
   NET *net= &thd->net;
   bool error= FALSE;
-  DBUG_ENTER("net_send_eof");
+  DBUG_ENTER("Protocol::net_send_eof");
 
   /*
     Check if client understand new format packets (OK instead of EOF)
@@ -413,8 +413,8 @@ static bool write_eof_packet(THD *thd, NET *net,
    @retval TRUE  An error occurred and the messages wasn't sent properly
 */
 
-bool net_send_error_packet(THD *thd, uint sql_errno, const char *err,
-                           const char* sqlstate)
+bool Protocol::net_send_error_packet(THD *thd, uint sql_errno, const char *err,
+                                     const char* sqlstate)
 
 {
   NET *net= &thd->net;
@@ -427,7 +427,7 @@ bool net_send_error_packet(THD *thd, uint sql_errno, const char *err,
   char buff[2+1+SQLSTATE_LENGTH+MYSQL_ERRMSG_SIZE], *pos;
   my_bool ret;
   uint8 save_compress;
-  DBUG_ENTER("send_error_packet");
+  DBUG_ENTER("Protocol::send_error_packet");
 
   if (net->vio == 0)
   {
@@ -731,7 +731,8 @@ void net_send_progress_packet(THD *thd)
 uchar *net_store_data(uchar *to, const uchar *from, size_t length)
 {
   to=net_store_length_fast(to,length);
-  memcpy(to,from,length);
+  if (length)
+    memcpy(to,from,length);
   return to+length;
 }
 
@@ -765,6 +766,7 @@ void Protocol::init(THD *thd_arg)
   convert= &thd->convert_buffer;
 #ifndef DBUG_OFF
   field_handlers= 0;
+  field_pos= 0;
 #endif
 }
 
@@ -838,27 +840,28 @@ bool Protocol_text::store_field_metadata(const THD * thd,
 {
   CHARSET_INFO *thd_charset= thd->variables.character_set_results;
   char *pos;
-  CHARSET_INFO *cs= system_charset_info;
   DBUG_ASSERT(field.is_sane());
 
   if (thd->client_capabilities & CLIENT_PROTOCOL_41)
   {
-    if (store(STRING_WITH_LEN("def"), cs, thd_charset) ||
-        store_str(field.db_name, cs, thd_charset) ||
-        store_str(field.table_name, cs, thd_charset) ||
-        store_str(field.org_table_name, cs, thd_charset) ||
-        store_str(field.col_name, cs, thd_charset) ||
-        store_str(field.org_col_name, cs, thd_charset))
+    const LEX_CSTRING def= {STRING_WITH_LEN("def")};
+    if (store_ident(def) ||
+        store_ident(field.db_name) ||
+        store_ident(field.table_name) ||
+        store_ident(field.org_table_name) ||
+        store_ident(field.col_name) ||
+        store_ident(field.org_col_name))
       return true;
     if (thd->client_capabilities & MARIADB_CLIENT_EXTENDED_METADATA)
     {
       Send_field_packed_extended_metadata metadata;
       metadata.pack(field);
+
       /*
         Don't apply character set conversion:
         extended metadata is a binary encoded data.
       */
-      if (store_str(metadata.lex_cstring(), cs, &my_charset_bin))
+      if (store_binary_string(metadata.ptr(), metadata.length()))
         return true;
     }
     if (packet->realloc(packet->length() + 12))
@@ -891,8 +894,8 @@ bool Protocol_text::store_field_metadata(const THD * thd,
   }
   else
   {
-    if (store_str(field.table_name, cs, thd_charset) ||
-        store_str(field.col_name, cs, thd_charset) ||
+    if (store_ident(field.table_name) ||
+        store_ident(field.col_name) ||
         packet->realloc(packet->length() + 10))
       return true;
     pos= (char*) packet->end();
@@ -907,6 +910,241 @@ bool Protocol_text::store_field_metadata(const THD * thd,
   }
   packet->length((uint) (pos - packet->ptr()));
   return false;
+}
+
+
+/*
+  MARIADB_CLIENT_CACHE_METADATA  support.
+
+  Bulk of the code below is dedicated to detecting whether column metadata has
+  changed after prepare, or between executions of a prepared statement.
+
+  For some prepared statements, metadata can't change without going through
+  Prepared_Statement::reprepare(), which makes detecting changes easy.
+
+  Others, "SELECT ?" & Co, are more fragile, and sensitive to input parameters,
+  or user variables. Detecting metadata change for this class of PS is harder,
+  we calculate signature (hash value), and check whether this changes between
+  executions. This is a more expensive method.
+*/
+
+
+/**
+  Detect whether column info can be changed without
+  PS repreparing.
+
+  Such colum info is called fragile. The opposite of
+  fragile is.
+
+
+  @param  it - Item representing column info
+  @return true, if columninfo is "fragile", false if it is stable
+
+
+  @todo does not work due to MDEV-23913. Currently,
+  everything about prepared statements is fragile.
+*/
+
+static bool is_fragile_columnifo(Item *it)
+{
+#define MDEV_23913_FIXED 0
+#if MDEV_23913_FIXED
+  if (dynamic_cast<Item_param *>(it))
+    return true;
+
+  if (dynamic_cast<Item_func_user_var *>(it))
+    return true;
+
+  if (dynamic_cast <Item_sp_variable*>(it))
+    return true;
+
+  /* Check arguments of functions.*/
+  auto item_args= dynamic_cast<Item_args *>(it);
+  if (!item_args)
+    return false;
+  auto args= item_args->arguments();
+  auto arg_count= item_args->argument_count();
+  for (uint i= 0; i < arg_count; i++)
+  {
+    if (is_fragile_columnifo(args[i]))
+      return true;
+  }
+  return false;
+#else /* MDEV-23913 fixed*/
+  return true;
+#endif
+}
+
+
+#define INVALID_METADATA_CHECKSUM 0
+
+
+/**
+  Calculate signature for column info sent to the client as CRC32 over data, 
+  that goes into the column info packet.
+  We assume that if checksum does not change, then column info was not
+  modified.
+
+  @param thd THD
+  @param list column info
+
+  @return CRC32 of the metadata
+*/
+
+static uint32 calc_metadata_hash(THD *thd, List<Item> *list)
+{
+  List_iterator_fast<Item> it(*list);
+  Item *item;
+  uint32 crc32_c= 0;
+  while ((item= it++))
+  {
+    Send_field field(thd, item);
+    auto field_type= item->type_handler()->field_type();
+    auto charset= item->charset_for_protocol();
+    /*
+       The data below should contain everything that influences
+       content of the column info packet.
+    */
+    LEX_CSTRING data[]=
+    {
+      field.table_name,
+      field.org_table_name,
+      field.col_name,
+      field.org_col_name,
+      field.db_name,
+      field.attr(MARIADB_FIELD_ATTR_DATA_TYPE_NAME),
+      field.attr(MARIADB_FIELD_ATTR_FORMAT_NAME),
+      {(const char *) &field.length, sizeof(field.length)},
+      {(const char *) &field.flags, sizeof(field.flags)},
+      {(const char *) &field.decimals, sizeof(field.decimals)},
+      {(const char *) &charset, sizeof(charset)},
+      {(const char *) &field_type, sizeof(field_type)},
+    };
+    for (const auto &chunk : data)
+      crc32_c= my_crc32c(crc32_c, chunk.str, chunk.length);
+  }
+
+  if (crc32_c == INVALID_METADATA_CHECKSUM)
+     return 1;
+  return crc32_c;
+}
+
+
+
+/**
+  Check if metadata columns have changed since last call to this
+  function.
+
+  @param send_column_info_state  saved state, changed if the function
+         return true. 
+  @param thd THD
+  @param list columninfo Items
+  @return true,if metadata columns have changed since last call,
+          false otherwise 
+*/
+
+static bool metadata_columns_changed(send_column_info_state &state, THD *thd,
+                                     List<Item> &list)
+{
+  if (!state.initialized)
+  {
+    state.initialized= true;
+    state.immutable= true;
+    Item *item;
+    List_iterator_fast<Item> it(list);
+    while ((item= it++))
+    {
+      if (is_fragile_columnifo(item))
+      {
+        state.immutable= false;
+        state.checksum= calc_metadata_hash(thd, &list);
+        break;
+      }
+    }
+    state.last_charset= thd->variables.character_set_client;
+    return true;
+  }
+  
+  /*
+    Since column info can change under our feet, we use more expensive
+    checksumming to check if column metadata has not changed since last time.
+  */
+  if (!state.immutable)
+  {
+    uint32 checksum= calc_metadata_hash(thd, &list);
+    if (checksum != state.checksum)
+    {
+      state.checksum= checksum;
+      state.last_charset= thd->variables.character_set_client;
+      return true;
+    }
+  }
+
+  /*
+    Character_set_client influences result set metadata, thus resend metadata
+    whenever it changes.
+  */
+  if (state.last_charset != thd->variables.character_set_client)
+  {
+    state.last_charset= thd->variables.character_set_client;
+    return true;
+  }
+
+  return false;
+}
+
+
+/**
+  Determine whether column info must be sent to the client.
+  Skip column info, if client supports caching, and (prepared) statement
+  output fields have not changed.
+
+  @param thd THD
+  @param list column info
+  @param flags send flags. If Protocol::SEND_FORCE_COLUMN_INFO is set,
+         this function will return true
+  @return true, if column info must be sent to the client.
+          false otherwise
+*/
+
+static bool should_send_column_info(THD* thd, List<Item>* list, uint flags) 
+{
+  if (!(thd->client_capabilities & MARIADB_CLIENT_CACHE_METADATA))
+  {
+    /* Client does not support abbreviated metadata.*/
+    return true;
+  }
+
+  if (!thd->cur_stmt)
+  {
+    /* Neither COM_PREPARE nor COM_EXECUTE run.*/
+    return true;
+  }
+
+  if (thd->spcont)
+  {
+    /* Always sent full metadata from inside the stored procedure.*/
+    return true;
+  }
+
+  if (flags & Protocol::SEND_FORCE_COLUMN_INFO)
+    return true;
+
+  auto &column_info_state= thd->cur_stmt->column_info_state;
+#ifndef DBUG_OFF
+  auto cmd= thd->get_command();
+#endif
+
+  DBUG_ASSERT(cmd == COM_STMT_EXECUTE || cmd == COM_STMT_PREPARE);
+  DBUG_ASSERT(cmd != COM_STMT_PREPARE || !column_info_state.initialized);
+
+  bool ret= metadata_columns_changed(column_info_state, thd, *list);
+
+  DBUG_ASSERT(cmd != COM_STMT_PREPARE || ret);
+  if (!ret)
+    thd->status_var.skip_metadata_count++;
+
+  return ret;
 }
 
 
@@ -935,30 +1173,44 @@ bool Protocol::send_result_set_metadata(List<Item> *list, uint flags)
   Protocol_text prot(thd, thd->variables.net_buffer_length);
   DBUG_ENTER("Protocol::send_result_set_metadata");
 
+  bool send_column_info= should_send_column_info(thd, list, flags);
+
   if (flags & SEND_NUM_ROWS)
-  {				// Packet with number of elements
-    uchar buff[MAX_INT_WIDTH];
+  {
+    /*
+      Packet with number of columns.
+
+      Will also have a 1 byte column info indicator, in case
+      MARIADB_CLIENT_CACHE_METADATA client capability is set.
+    */
+    uchar buff[MAX_INT_WIDTH+1];
     uchar *pos= net_store_length(buff, list->elements);
+    if (thd->client_capabilities & MARIADB_CLIENT_CACHE_METADATA)
+      *pos++= (uchar)send_column_info;
+
     DBUG_ASSERT(pos <= buff + sizeof(buff));
     if (my_net_write(&thd->net, buff, (size_t) (pos-buff)))
       DBUG_RETURN(1);
   }
 
+  if (send_column_info)
+  {
 #ifndef DBUG_OFF
-  field_handlers= (const Type_handler**) thd->alloc(sizeof(field_handlers[0]) *
-                                                    list->elements);
+    field_handlers= (const Type_handler **) thd->alloc(
+        sizeof(field_handlers[0]) * list->elements);
 #endif
 
-  for (uint pos= 0; (item=it++); pos++)
-  {
-    prot.prepare_for_resend();
-    if (prot.store_field_metadata(thd, item, pos))
-      goto err;
-    if (prot.write())
-      DBUG_RETURN(1);
+    for (uint pos= 0; (item= it++); pos++)
+    {
+      prot.prepare_for_resend();
+      if (prot.store_item_metadata(thd, item, pos))
+        goto err;
+      if (prot.write())
+        DBUG_RETURN(1);
 #ifndef DBUG_OFF
-    field_handlers[pos]= item->type_handler();
+      field_handlers[pos]= item->type_handler();
 #endif
+    }
   }
 
   if (flags & SEND_EOF)
@@ -1032,7 +1284,7 @@ bool Protocol::write()
 #endif /* EMBEDDED_LIBRARY */
 
 
-bool Protocol_text::store_field_metadata(THD *thd, Item *item, uint pos)
+bool Protocol_text::store_item_metadata(THD *thd, Item *item, uint pos)
 {
   Send_field field(thd, item);
   return store_field_metadata(thd, field, item->charset_for_protocol(), pos);
@@ -1175,15 +1427,23 @@ bool Protocol::store_string_aux(const char *from, size_t length,
                                 CHARSET_INFO *fromcs, CHARSET_INFO *tocs)
 {
   /* 'tocs' is set 0 when client issues SET character_set_results=NULL */
-  if (tocs && !my_charset_same(fromcs, tocs) &&
-      fromcs != &my_charset_bin &&
-      tocs != &my_charset_bin)
+  if (needs_conversion(fromcs, tocs))
   {
     /* Store with conversion */
     return net_store_data_cs((uchar*) from, length, fromcs, tocs);
   }
   /* Store without conversion */
   return net_store_data((uchar*) from, length);
+}
+
+
+bool Protocol_text::store_numeric_string_aux(const char *from, size_t length)
+{
+  CHARSET_INFO *tocs= thd->variables.character_set_results;
+  // 'tocs' is NULL when the client issues SET character_set_results=NULL
+  if (tocs && (tocs->state & MY_CS_NONASCII))   // Conversion needed
+    return net_store_data_cs((uchar*) from, length, &my_charset_latin1, tocs);
+  return net_store_data((uchar*) from, length); // No conversion
 }
 
 
@@ -1199,10 +1459,13 @@ bool Protocol::store_warning(const char *from, size_t length)
 }
 
 
-bool Protocol_text::store(const char *from, size_t length,
-                          CHARSET_INFO *fromcs, CHARSET_INFO *tocs)
+bool Protocol_text::store_str(const char *from, size_t length,
+                              CHARSET_INFO *fromcs, CHARSET_INFO *tocs)
 {
 #ifndef DBUG_OFF
+  DBUG_PRINT("info", ("Protocol_text::store field %u : %.*b", field_pos,
+                      (int) length, (length == 0 ? "" : from)));
+  DBUG_ASSERT(field_handlers == 0 || field_pos < field_count);
   DBUG_ASSERT(valid_handler(field_pos, PROTOCOL_SEND_STRING));
   field_pos++;
 #endif
@@ -1210,18 +1473,19 @@ bool Protocol_text::store(const char *from, size_t length,
 }
 
 
-bool Protocol_text::store(const char *from, size_t length,
-                          CHARSET_INFO *fromcs)
+bool Protocol_text::store_numeric_zerofill_str(const char *from,
+                                               size_t length,
+                                               protocol_send_type_t send_type)
 {
-  CHARSET_INFO *tocs= this->thd->variables.character_set_results;
 #ifndef DBUG_OFF
-  DBUG_PRINT("info", ("Protocol_text::store field %u (%u): %.*b", field_pos,
-                      field_count, (int) length, (length == 0 ? "" : from)));
+  DBUG_PRINT("info",
+       ("Protocol_text::store_numeric_zerofill_str field %u : %.*b",
+        field_pos, (int) length, (length == 0 ? "" : from)));
   DBUG_ASSERT(field_handlers == 0 || field_pos < field_count);
-  DBUG_ASSERT(valid_handler(field_pos, PROTOCOL_SEND_STRING));
+  DBUG_ASSERT(valid_handler(field_pos, send_type));
   field_pos++;
 #endif
-  return store_string_aux(from, length, fromcs, tocs);
+  return store_numeric_string_aux(from, length);
 }
 
 
@@ -1232,8 +1496,8 @@ bool Protocol_text::store_tiny(longlong from)
   field_pos++;
 #endif
   char buff[22];
-  return net_store_data((uchar*) buff,
-			(size_t) (int10_to_str((int) from, buff, -10) - buff));
+  size_t length= (size_t) (int10_to_str((int) from, buff, -10) - buff);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1244,9 +1508,8 @@ bool Protocol_text::store_short(longlong from)
   field_pos++;
 #endif
   char buff[22];
-  return net_store_data((uchar*) buff,
-			(size_t) (int10_to_str((int) from, buff, -10) -
-                                  buff));
+  size_t length= (size_t) (int10_to_str((int) from, buff, -10) - buff);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1257,9 +1520,9 @@ bool Protocol_text::store_long(longlong from)
   field_pos++;
 #endif
   char buff[22];
-  return net_store_data((uchar*) buff,
-			(size_t) (int10_to_str((long int)from, buff,
-                                               (from <0)?-10:10)-buff));
+  size_t length= (size_t) (int10_to_str((long int)from, buff,
+                                        (from < 0) ? - 10 : 10) - buff);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1270,10 +1533,10 @@ bool Protocol_text::store_longlong(longlong from, bool unsigned_flag)
   field_pos++;
 #endif
   char buff[22];
-  return net_store_data((uchar*) buff,
-			(size_t) (longlong10_to_str(from,buff,
-                                                    unsigned_flag ? 10 : -10)-
-                                  buff));
+  size_t length= (size_t) (longlong10_to_str(from, buff,
+                                             unsigned_flag ? 10 : -10) -
+                           buff);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1285,29 +1548,29 @@ bool Protocol_text::store_decimal(const my_decimal *d)
 #endif
   StringBuffer<DECIMAL_MAX_STR_LENGTH> str;
   (void) d->to_string(&str);
-  return net_store_data((uchar*) str.ptr(), str.length());
+  return store_numeric_string_aux(str.ptr(), str.length());
 }
 
 
-bool Protocol_text::store(float from, uint32 decimals, String *buffer)
+bool Protocol_text::store_float(float from, uint32 decimals)
 {
 #ifndef DBUG_OFF
   DBUG_ASSERT(valid_handler(field_pos, PROTOCOL_SEND_FLOAT));
   field_pos++;
 #endif
-  Float(from).to_string(buffer, decimals);
-  return net_store_data((uchar*) buffer->ptr(), buffer->length());
+  Float(from).to_string(&buffer, decimals);
+  return store_numeric_string_aux(buffer.ptr(), buffer.length());
 }
 
 
-bool Protocol_text::store(double from, uint32 decimals, String *buffer)
+bool Protocol_text::store_double(double from, uint32 decimals)
 {
 #ifndef DBUG_OFF
   DBUG_ASSERT(valid_handler(field_pos, PROTOCOL_SEND_DOUBLE));
   field_pos++;
 #endif
-  buffer->set_real(from, decimals, thd->charset());
-  return net_store_data((uchar*) buffer->ptr(), buffer->length());
+  buffer.set_real(from, decimals, thd->charset());
+  return store_numeric_string_aux(buffer.ptr(), buffer.length());
 }
 
 
@@ -1315,12 +1578,6 @@ bool Protocol_text::store(Field *field)
 {
   if (field->is_null())
     return store_null();
-#ifndef DBUG_OFF
-  field_pos++;
-#endif
-  char buff[MAX_FIELD_WIDTH];
-  String str(buff,sizeof(buff), &my_charset_bin);
-  CHARSET_INFO *tocs= this->thd->variables.character_set_results;
 #ifdef DBUG_ASSERT_EXISTS
   TABLE *table= field->table;
   my_bitmap_map *old_map= 0;
@@ -1328,13 +1585,14 @@ bool Protocol_text::store(Field *field)
     old_map= dbug_tmp_use_all_columns(table, table->read_set);
 #endif
 
-  field->val_str(&str);
+  bool rc= field->send(this);
+
 #ifdef DBUG_ASSERT_EXISTS
   if (old_map)
     dbug_tmp_restore_column_map(table->read_set, old_map);
 #endif
 
-  return store_string_aux(str.ptr(), str.length(), str.charset(), tocs);
+  return rc;
 }
 
 
@@ -1346,7 +1604,7 @@ bool Protocol_text::store(MYSQL_TIME *tm, int decimals)
 #endif
   char buff[MAX_DATE_STRING_REP_LENGTH];
   uint length= my_datetime_to_str(tm, buff, decimals);
-  return net_store_data((uchar*) buff, length);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1358,7 +1616,7 @@ bool Protocol_text::store_date(MYSQL_TIME *tm)
 #endif
   char buff[MAX_DATE_STRING_REP_LENGTH];
   size_t length= my_date_to_str(tm, buff);
-  return net_store_data((uchar*) buff, length);
+  return store_numeric_string_aux(buff, length);
 }
 
 
@@ -1370,7 +1628,7 @@ bool Protocol_text::store_time(MYSQL_TIME *tm, int decimals)
 #endif
   char buff[MAX_DATE_STRING_REP_LENGTH];
   uint length= my_time_to_str(tm, buff, decimals);
-  return net_store_data((uchar*) buff, length);
+  return store_numeric_string_aux(buff, length);
 }
 
 /**
@@ -1452,16 +1710,8 @@ void Protocol_binary::prepare_for_resend()
 }
 
 
-bool Protocol_binary::store(const char *from, size_t length,
-                            CHARSET_INFO *fromcs)
-{
-  CHARSET_INFO *tocs= thd->variables.character_set_results;
-  field_pos++;
-  return store_string_aux(from, length, fromcs, tocs);
-}
-
-bool Protocol_binary::store(const char *from, size_t length,
-                            CHARSET_INFO *fromcs, CHARSET_INFO *tocs)
+bool Protocol_binary::store_str(const char *from, size_t length,
+                                CHARSET_INFO *fromcs, CHARSET_INFO *tocs)
 {
   field_pos++;
   return store_string_aux(from, length, fromcs, tocs);
@@ -1523,14 +1773,14 @@ bool Protocol_binary::store_decimal(const my_decimal *d)
 {
 #ifndef DBUG_OFF
   DBUG_ASSERT(0); // This method is not used yet
-  field_pos++;
 #endif
   StringBuffer<DECIMAL_MAX_STR_LENGTH> str;
   (void) d->to_string(&str);
-  return store(str.ptr(), str.length(), str.charset());
+  return store_str(str.ptr(), str.length(), str.charset(),
+                   thd->variables.character_set_results);
 }
 
-bool Protocol_binary::store(float from, uint32 decimals, String *buffer)
+bool Protocol_binary::store_float(float from, uint32 decimals)
 {
   field_pos++;
   char *to= packet->prep_append(4, PACKET_BUFFER_EXTRA_ALLOC);
@@ -1541,7 +1791,7 @@ bool Protocol_binary::store(float from, uint32 decimals, String *buffer)
 }
 
 
-bool Protocol_binary::store(double from, uint32 decimals, String *buffer)
+bool Protocol_binary::store_double(double from, uint32 decimals)
 {
   field_pos++;
   char *to= packet->prep_append(8, PACKET_BUFFER_EXTRA_ALLOC);
@@ -1555,12 +1805,12 @@ bool Protocol_binary::store(double from, uint32 decimals, String *buffer)
 bool Protocol_binary::store(Field *field)
 {
   /*
-    We should not increment field_pos here as send_binary() will call another
+    We should not increment field_pos here as send() will call another
     protocol function to do this for us
   */
   if (field->is_null())
     return store_null();
-  return field->send_binary(this);
+  return field->send(this);
 }
 
 
@@ -1580,7 +1830,7 @@ bool Protocol_binary::store(MYSQL_TIME *tm, int decimals)
   DBUG_ASSERT(decimals == AUTO_SEC_PART_DIGITS ||
               (decimals >= 0 && decimals <= TIME_SECOND_PART_DIGITS));
   if (decimals != AUTO_SEC_PART_DIGITS)
-    my_time_trunc(tm, decimals);
+    my_datetime_trunc(tm, decimals);
   int4store(pos+7, tm->second_part);
   if (tm->second_part)
     length=11;
@@ -1684,7 +1934,8 @@ bool Protocol_binary::send_out_parameters(List<Item_param> *sp_params)
   thd->server_status|= SERVER_PS_OUT_PARAMS | SERVER_MORE_RESULTS_EXISTS;
 
   /* Send meta-data. */
-  if (send_result_set_metadata(&out_param_lst, SEND_NUM_ROWS | SEND_EOF))
+  if (send_result_set_metadata(&out_param_lst,
+        SEND_NUM_ROWS | SEND_EOF | SEND_FORCE_COLUMN_INFO))
     return TRUE;
 
   /* Send data. */

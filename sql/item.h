@@ -120,20 +120,19 @@ enum precedence {
   XOR_PRECEDENCE,       // XOR
   AND_PRECEDENCE,       // AND, &&
   NOT_PRECEDENCE,       // NOT (unless HIGH_NOT_PRECEDENCE)
-  BETWEEN_PRECEDENCE,   // BETWEEN, CASE, WHEN, THEN, ELSE
-  CMP_PRECEDENCE,       // =, <=>, >=, >, <=, <, <>, !=, IS, LIKE, REGEXP, IN
+  CMP_PRECEDENCE,       // =, <=>, >=, >, <=, <, <>, !=, IS
+  BETWEEN_PRECEDENCE,   // BETWEEN
+  IN_PRECEDENCE,        // IN, LIKE, REGEXP
   BITOR_PRECEDENCE,     // |
   BITAND_PRECEDENCE,    // &
   SHIFT_PRECEDENCE,     // <<, >>
-  ADDINTERVAL_PRECEDENCE, // first argument in +INTERVAL
+  INTERVAL_PRECEDENCE,  // first argument in +INTERVAL
   ADD_PRECEDENCE,       // +, -
   MUL_PRECEDENCE,       // *, /, DIV, %, MOD
   BITXOR_PRECEDENCE,    // ^
   PIPES_PRECEDENCE,     // || (if PIPES_AS_CONCAT)
-  NEG_PRECEDENCE,       // unary -, ~
-  BANG_PRECEDENCE,      // !, NOT (if HIGH_NOT_PRECEDENCE)
+  NEG_PRECEDENCE,       // unary -, ~, !, NOT (if HIGH_NOT_PRECEDENCE)
   COLLATE_PRECEDENCE,   // BINARY, COLLATE
-  INTERVAL_PRECEDENCE,  // INTERVAL
   DEFAULT_PRECEDENCE,
   HIGHEST_PRECEDENCE
 };
@@ -164,7 +163,7 @@ void dummy_error_processor(THD *thd, void *data);
 void view_error_processor(THD *thd, void *data);
 
 /*
-  Instances of Name_resolution_context store the information necesary for
+  Instances of Name_resolution_context store the information necessary for
   name resolution of Items and other context analysis of a query made in
   fix_fields().
 
@@ -344,7 +343,7 @@ public:
   Monotonicity is defined only for Item* trees that represent table
   partitioning expressions (i.e. have no subselects/user vars/PS parameters
   etc etc). An Item* tree is assumed to have the same monotonicity properties
-  as its correspoinding function F:
+  as its corresponding function F:
 
   [signed] longlong F(field1, field2, ...) {
     put values of field_i into table record buffer;
@@ -962,6 +961,10 @@ public:
 #endif
   }		/*lint -e1509 */
   void set_name(THD *thd, const char *str, size_t length, CHARSET_INFO *cs);
+  void set_name(THD *thd, String *str)
+  {
+    set_name(thd, str->ptr(), str->length(), str->charset());
+  }
   void set_name(THD *thd, const LEX_CSTRING &str,
                 CHARSET_INFO *cs= system_charset_info)
   {
@@ -970,6 +973,13 @@ public:
   void set_name_no_truncate(THD *thd, const char *str, uint length,
                             CHARSET_INFO *cs);
   void init_make_send_field(Send_field *tmp_field, const Type_handler *h);
+  void share_name_with(const Item *item)
+  {
+    name= item->name;
+    common_flags= static_cast<uint8>
+     ((common_flags & ~IS_AUTO_GENERATED_NAME) |
+      (item->common_flags & IS_AUTO_GENERATED_NAME));
+  }
   virtual void cleanup();
   virtual void make_send_field(THD *thd, Send_field *field);
 
@@ -1149,7 +1159,7 @@ public:
   /*
     real_type() is the type of base item.  This is same as type() for
     most items, except Item_ref() and Item_cache_wrapper() where it
-    shows the type for the underlaying item.
+    shows the type for the underlying item.
   */
   virtual enum Type real_type() const { return type(); }
   
@@ -1295,7 +1305,7 @@ public:
       The caller can modify the returned String, if it's not marked
       "const" (with the String::mark_as_const() method). That means that
       if the item returns its own internal buffer (e.g. tmp_value), it
-      *must* be marked "const" [1]. So normally it's preferrable to
+      *must* be marked "const" [1]. So normally it's preferable to
       return the result value in the String, that was passed as an
       argument. But, for example, SUBSTR() returns a String that simply
       points into the buffer of SUBSTR()'s args[0]->val_str(). Such a
@@ -1329,16 +1339,13 @@ public:
   {
    /*
      The default implementation for the Items that do not need native format:
-     - Item_basic_value
+     - Item_basic_value (default implementation)
      - Item_copy
      - Item_exists_subselect
      - Item_sum_field
      - Item_sum_or_func (default implementation)
      - Item_proc
      - Item_type_holder (as val_xxx() are never called for it);
-     - TODO: Item_name_const will need val_native() in the future,
-       when we add this syntax:
-         TIMESTAMP WITH LOCAL TIMEZONE'2001-01-01 00:00:00'
 
      These hybrid Item types override val_native():
      - Item_field
@@ -1349,6 +1356,8 @@ public:
      - Item_direct_ref
      - Item_direct_view_ref
      - Item_ref_null_helper
+     - Item_name_const
+     - Item_time_literal
      - Item_sum_or_func
          Note, these hybrid type Item_sum_or_func descendants
          override the default implementation:
@@ -1713,6 +1722,8 @@ public:
     mysql_register_view().
   */
   virtual enum precedence precedence() const { return DEFAULT_PRECEDENCE; }
+  enum precedence higher_precedence() const
+  { return (enum precedence)(precedence() + 1); }
   void print_parenthesised(String *str, enum_query_type query_type,
                            enum precedence parent_prec);
   /**
@@ -1771,7 +1782,7 @@ public:
      @param cond_ptr[OUT] Store a replacement item here if the condition
                           can be simplified, e.g.:
                             WHERE part1 OR part2 OR part3
-                          with one of the partN evalutating to SEL_TREE::ALWAYS.
+                          with one of the partN evaluating to SEL_TREE::ALWAYS.
    */
    virtual SEL_TREE *get_mm_tree(RANGE_OPT_PARAM *param, Item **cond_ptr);
   /*
@@ -1840,6 +1851,18 @@ public:
       when they are "top level".
   */
   virtual void top_level_item() {}
+  /*
+    Return TRUE if it is item of top WHERE level (AND/OR)  and it is
+    important, return FALSE if it not important (we can not use to simplify
+    calculations) or not top level
+  */
+  virtual bool is_top_level_item() const
+  { return FALSE; /* not important */}
+  /*
+    return IN/ALL/ANY subquery or NULL
+  */
+  virtual Item_in_subselect* get_IN_subquery()
+  { return NULL; /* in is not IN/ALL/ANY */ }
   /*
     set field of temporary table for Item which can be switched on temporary
     table during query processing (grouping and so on)
@@ -2353,8 +2376,9 @@ public:
   virtual bool is_outer_field() const { DBUG_ASSERT(is_fixed()); return FALSE; }
 
   /**
-    Checks if this item or any of its decendents contains a subquery. This is a
-    replacement of the former Item::has_subquery() and Item::with_subselect.
+    Checks if this item or any of its descendents contains a subquery.
+    This is a replacement of the former Item::has_subquery() and
+    Item::with_subselect.
   */
   virtual bool with_subquery() const { DBUG_ASSERT(is_fixed()); return false; }
 
@@ -2376,7 +2400,7 @@ public:
     if (join_tab_idx_arg < join_tab_idx)
       join_tab_idx= join_tab_idx_arg;
   }
-  virtual uint get_join_tab_idx() { return join_tab_idx; }
+  uint get_join_tab_idx() const { return join_tab_idx; }
 
   table_map view_used_tables(TABLE_LIST *view)
   {
@@ -2435,7 +2459,8 @@ public:
   }
   bool pushable_cond_checker_for_subquery(uchar *arg)
   {
-    return excl_dep_on_in_subq_left_part((Item_in_subselect *)arg);
+    DBUG_ASSERT(((Item*) arg)->get_IN_subquery());
+    return excl_dep_on_in_subq_left_part(((Item*)arg)->get_IN_subquery());
   }
   Item *build_pushable_cond(THD *thd,
                             Pushdown_checker checker,
@@ -2754,12 +2779,15 @@ protected:
     {
       my_string_metadata_get(this, str->charset(), str->ptr(), str->length());
     }
-    Metadata(const String *str, uint repertoire_arg)
+    Metadata(const String *str, my_repertoire_t repertoire_arg)
     {
       MY_STRING_METADATA::repertoire= repertoire_arg;
       MY_STRING_METADATA::char_length= str->numchars();
     }
-    uint repertoire() const { return MY_STRING_METADATA::repertoire; }
+    my_repertoire_t repertoire() const
+    {
+      return MY_STRING_METADATA::repertoire;
+    }
     size_t char_length() const { return MY_STRING_METADATA::char_length; }
   };
   void fix_charset_and_length(CHARSET_INFO *cs,
@@ -3152,6 +3180,7 @@ public:
   String *val_str(String *sp);
   my_decimal *val_decimal(my_decimal *);
   bool get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate);
+  bool val_native(THD *thd, Native *to);
   bool is_null();
   virtual void print(String *str, enum_query_type query_type);
 
@@ -3453,6 +3482,8 @@ public:
   longlong val_int_endpoint(bool left_endp, bool *incl_endp);
   bool get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate);
   bool get_date_result(THD *thd, MYSQL_TIME *ltime,date_mode_t fuzzydate);
+  longlong val_datetime_packed(THD *thd);
+  longlong val_time_packed(THD *thd);
   bool is_null() { return field->is_null(); }
   void update_null_value();
   void update_table_bitmaps()
@@ -4222,9 +4253,7 @@ public:
   Item_uint(THD *thd, ulonglong i): Item_int(thd, i, 10) {}
   Item_uint(THD *thd, const char *str_arg, longlong i, uint length);
   double val_real() { return ulonglong2double((ulonglong)value); }
-  String *val_str(String*);
   Item *clone_item(THD *thd);
-  virtual void print(String *str, enum_query_type query_type);
   Item *neg(THD *thd);
   uint decimal_precision() const { return max_length; }
   Item *get_copy(THD *thd)
@@ -4363,7 +4392,7 @@ protected:
                                    const Metadata metadata)
   {
     fix_from_value(dv, metadata);
-    set_name(thd, str_value.lex_cstring(), str_value.charset());
+    set_name(thd, &str_value);
   }
 protected:
   /* Just create an item and do not fill string representation */
@@ -4387,7 +4416,7 @@ public:
   }
   // Constructors with the item name set from its value
   Item_string(THD *thd, const char *str, uint length, CHARSET_INFO *cs,
-              Derivation dv, uint repertoire)
+              Derivation dv, my_repertoire_t repertoire)
    :Item_literal(thd)
   {
     str_value.set_or_copy_aligned(str, length, cs);
@@ -4401,7 +4430,7 @@ public:
     fix_and_set_name_from_value(thd, dv, Metadata(&str_value));
   }
   Item_string(THD *thd, const String *str, CHARSET_INFO *tocs, uint *conv_errors,
-              Derivation dv, uint repertoire)
+              Derivation dv, my_repertoire_t repertoire)
    :Item_literal(thd)
   {
     if (str_value.copy(str, tocs, conv_errors))
@@ -4419,7 +4448,7 @@ public:
     set_name(thd, name_par);
   }
   Item_string(THD *thd, const LEX_CSTRING &name_par, const LEX_CSTRING &str,
-              CHARSET_INFO *cs, Derivation dv, uint repertoire)
+              CHARSET_INFO *cs, Derivation dv, my_repertoire_t repertoire)
    :Item_literal(thd)
   {
     str_value.set_or_copy_aligned(str.str, str.length, cs);
@@ -4552,7 +4581,7 @@ public:
   Item_static_string_func(THD *thd, const LEX_CSTRING &name_par,
                           const String *str,
                           CHARSET_INFO *tocs, uint *conv_errors,
-                          Derivation dv, uint repertoire):
+                          Derivation dv, my_repertoire_t repertoire):
     Item_string(thd, str, tocs, conv_errors, dv, repertoire),
     func_name(name_par)
   {}
@@ -4799,29 +4828,20 @@ public:
 
 class Item_temporal_literal :public Item_literal
 {
-protected:
-  MYSQL_TIME cached_time;
 public:
-  /**
-    Constructor for Item_date_literal.
-    @param ltime  DATE value.
-  */
-  Item_temporal_literal(THD *thd, const MYSQL_TIME *ltime)
+  Item_temporal_literal(THD *thd)
    :Item_literal(thd)
   {
     collation= DTCollation_numeric();
     decimals= 0;
-    cached_time= *ltime;
   }
-  Item_temporal_literal(THD *thd, const MYSQL_TIME *ltime, uint dec_arg):
+  Item_temporal_literal(THD *thd, uint dec_arg):
     Item_literal(thd)
   {
     collation= DTCollation_numeric();
     decimals= dec_arg;
-    cached_time= *ltime;
   }
 
-  const MYSQL_TIME *const_ptr_mysql_time() const { return &cached_time; }
   int save_in_field(Field *field, bool no_conversions)
   { return save_date_in_field(field, no_conversions); }
 };
@@ -4832,27 +4852,62 @@ public:
 */
 class Item_date_literal: public Item_temporal_literal
 {
-public:
-  Item_date_literal(THD *thd, const MYSQL_TIME *ltime)
-    :Item_temporal_literal(thd, ltime)
+protected:
+  Date cached_time;
+  bool update_null()
   {
+    return maybe_null &&
+           (null_value= cached_time.check_date_with_warn(current_thd));
+  }
+public:
+  Item_date_literal(THD *thd, const Date *ltime)
+    :Item_temporal_literal(thd),
+     cached_time(*ltime)
+  {
+    DBUG_ASSERT(cached_time.is_valid_date());
     max_length= MAX_DATE_WIDTH;
     /*
       If date has zero month or day, it can return NULL in case of
       NO_ZERO_DATE or NO_ZERO_IN_DATE.
-      We can't just check the current sql_mode here in constructor,
+      If date is `February 30`, it can return NULL in case if
+      no ALLOW_INVALID_DATES is set.
+      We can't set null_value using the current sql_mode here in constructor,
       because sql_mode can change in case of prepared statements
       between PREPARE and EXECUTE.
+      Here we only set maybe_null to true if the value has such anomalies.
+      Later (during execution time), if maybe_null is true, then the value
+      will be checked per row, according to the execution time sql_mode.
+      The check_date() below call should cover all cases mentioned.
     */
-    maybe_null= !ltime->month || !ltime->day;
+    maybe_null= cached_time.check_date(TIME_NO_ZERO_DATE | TIME_NO_ZERO_IN_DATE);
   }
   const Type_handler *type_handler() const { return &type_handler_newdate; }
   void print(String *str, enum_query_type query_type);
+  const MYSQL_TIME *const_ptr_mysql_time() const
+  {
+    return cached_time.get_mysql_time();
+  }
   Item *clone_item(THD *thd);
-  longlong val_int() { return Date(this).to_longlong(); }
-  double val_real() { return Date(this).to_double(); }
-  String *val_str(String *to) { return Date(this).to_string(to); }
-  my_decimal *val_decimal(my_decimal *to) { return Date(this).to_decimal(to); }
+  longlong val_int()
+  {
+    return update_null() ? 0 : cached_time.to_longlong();
+  }
+  double val_real()
+  {
+    return update_null() ? 0 : cached_time.to_double();
+  }
+  String *val_str(String *to)
+  {
+    return update_null() ? 0 : cached_time.to_string(to);
+  }
+  my_decimal *val_decimal(my_decimal *to)
+  {
+    return update_null() ? 0 : cached_time.to_decimal(to);
+  }
+  longlong val_datetime_packed(THD *thd)
+  {
+    return update_null() ? 0 : cached_time.valid_date_to_packed();
+  }
   bool get_date(THD *thd, MYSQL_TIME *res, date_mode_t fuzzydate);
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_date_literal>(thd, this); }
@@ -4864,20 +4919,36 @@ public:
 */
 class Item_time_literal: public Item_temporal_literal
 {
+protected:
+  Time cached_time;
 public:
-  Item_time_literal(THD *thd, const MYSQL_TIME *ltime, uint dec_arg):
-    Item_temporal_literal(thd, ltime, dec_arg)
+  Item_time_literal(THD *thd, const Time *ltime, uint dec_arg):
+    Item_temporal_literal(thd, dec_arg),
+    cached_time(*ltime)
   {
+    DBUG_ASSERT(cached_time.is_valid_time());
     max_length= MIN_TIME_WIDTH + (decimals ? decimals + 1 : 0);
   }
   const Type_handler *type_handler() const { return &type_handler_time2; }
   void print(String *str, enum_query_type query_type);
+  const MYSQL_TIME *const_ptr_mysql_time() const
+  {
+    return cached_time.get_mysql_time();
+  }
   Item *clone_item(THD *thd);
-  longlong val_int() { return Time(this).to_longlong(); }
-  double val_real() { return Time(this).to_double(); }
-  String *val_str(String *to) { return Time(this).to_string(to, decimals); }
-  my_decimal *val_decimal(my_decimal *to) { return Time(this).to_decimal(to); }
+  longlong val_int() { return cached_time.to_longlong(); }
+  double val_real() { return cached_time.to_double(); }
+  String *val_str(String *to) { return cached_time.to_string(to, decimals); }
+  my_decimal *val_decimal(my_decimal *to) { return cached_time.to_decimal(to); }
+  longlong val_time_packed(THD *thd)
+  {
+    return cached_time.valid_time_to_packed();
+  }
   bool get_date(THD *thd, MYSQL_TIME *res, date_mode_t fuzzydate);
+  bool val_native(THD *thd, Native *to)
+  {
+    return Time(thd, this).to_native(to, decimals);
+  }
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_time_literal>(thd, this); }
 };
@@ -4888,26 +4959,49 @@ public:
 */
 class Item_datetime_literal: public Item_temporal_literal
 {
-public:
-  Item_datetime_literal(THD *thd, const MYSQL_TIME *ltime, uint dec_arg):
-    Item_temporal_literal(thd, ltime, dec_arg)
+protected:
+  Datetime cached_time;
+  bool update_null()
   {
+    return maybe_null &&
+           (null_value= cached_time.check_date_with_warn(current_thd));
+  }
+public:
+  Item_datetime_literal(THD *thd, const Datetime *ltime, uint dec_arg):
+    Item_temporal_literal(thd, dec_arg),
+    cached_time(*ltime)
+  {
+    DBUG_ASSERT(cached_time.is_valid_datetime());
     max_length= MAX_DATETIME_WIDTH + (decimals ? decimals + 1 : 0);
     // See the comment on maybe_null in Item_date_literal
-    maybe_null= !ltime->month || !ltime->day;
+    maybe_null= cached_time.check_date(TIME_NO_ZERO_DATE | TIME_NO_ZERO_IN_DATE);
   }
   const Type_handler *type_handler() const { return &type_handler_datetime2; }
   void print(String *str, enum_query_type query_type);
+  const MYSQL_TIME *const_ptr_mysql_time() const
+  {
+    return cached_time.get_mysql_time();
+  }
   Item *clone_item(THD *thd);
-  longlong val_int() { return Datetime(this).to_longlong(); }
-  double val_real() { return Datetime(this).to_double(); }
+  longlong val_int()
+  {
+    return update_null() ? 0 : cached_time.to_longlong();
+  }
+  double val_real()
+  {
+    return update_null() ? 0 : cached_time.to_double();
+  }
   String *val_str(String *to)
   {
-    return Datetime(this).to_string(to, decimals);
+    return update_null() ? NULL : cached_time.to_string(to, decimals);
   }
   my_decimal *val_decimal(my_decimal *to)
   {
-    return Datetime(this).to_decimal(to);
+    return update_null() ? NULL : cached_time.to_decimal(to);
+  }
+  longlong val_datetime_packed(THD *thd)
+  {
+    return update_null() ? 0 : cached_time.valid_datetime_to_packed();
   }
   bool get_date(THD *thd, MYSQL_TIME *res, date_mode_t fuzzydate);
   Item *get_copy(THD *thd)
@@ -4944,11 +5038,14 @@ class Item_date_literal_for_invalid_dates: public Item_date_literal
     in sql_mode=TRADITIONAL.
   */
 public:
-  Item_date_literal_for_invalid_dates(THD *thd, const MYSQL_TIME *ltime)
-   :Item_date_literal(thd, ltime) { }
+  Item_date_literal_for_invalid_dates(THD *thd, const Date *ltime)
+   :Item_date_literal(thd, ltime)
+  {
+    maybe_null= false;
+  }
   bool get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
   {
-    *ltime= cached_time;
+    cached_time.copy_to_mysql_time(ltime);
     return (null_value= false);
   }
 };
@@ -4962,11 +5059,14 @@ class Item_datetime_literal_for_invalid_dates: public Item_datetime_literal
 {
 public:
   Item_datetime_literal_for_invalid_dates(THD *thd,
-                                          const MYSQL_TIME *ltime, uint dec_arg)
-   :Item_datetime_literal(thd, ltime, dec_arg) { }
+                                          const Datetime *ltime, uint dec_arg)
+   :Item_datetime_literal(thd, ltime, dec_arg)
+  {
+    maybe_null= false;
+  }
   bool get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
   {
-    *ltime= cached_time;
+    cached_time.copy_to_mysql_time(ltime);
     return (null_value= false);
   }
 };
@@ -5347,7 +5447,11 @@ public:
   {
     (*ref)->restore_to_before_no_rows_in_result();
   }
-  virtual void print(String *str, enum_query_type query_type);
+  void print(String *str, enum_query_type query_type);
+  enum precedence precedence() const
+  {
+    return ref ? (*ref)->precedence() : DEFAULT_PRECEDENCE;
+  }
   void cleanup();
   Item_field *field_for_view_update()
     { return (*ref)->field_for_view_update(); }
@@ -6043,7 +6147,7 @@ public:
    
     This is the method that updates the cached value.
     It must be explicitly called by the user of this class to store the value 
-    of the orginal item in the cache.
+    of the original item in the cache.
   */  
   virtual void copy() = 0;
 
@@ -6854,6 +6958,10 @@ public:
   my_decimal *val_decimal(my_decimal *to)
   {
     return has_value() ? Time(this).to_decimal(to) : NULL;
+  }
+  bool val_native(THD *thd, Native *to)
+  {
+    return has_value() ? Time(thd, this).to_native(to, decimals) : true;
   }
 };
 

@@ -1,3 +1,4 @@
+
 # Copyright (c) 2006, 2017, Oracle and/or its affiliates. All rights reserved.
 # Copyright (c) 2014, 2020, MariaDB Corporation.
 #
@@ -28,6 +29,7 @@ SET(INNOBASE_SOURCES
 	btr/btr0pcur.cc
 	btr/btr0sea.cc
 	btr/btr0defragment.cc
+	buf/buf0block_hint.cc
 	buf/buf0buddy.cc
 	buf/buf0buf.cc
 	buf/buf0dblwr.cc
@@ -103,7 +105,6 @@ SET(INNOBASE_SOURCES
 	include/data0types.h
 	include/db0err.h
 	include/dict0boot.h
-	include/dict0boot.ic
 	include/dict0crea.h
 	include/dict0crea.ic
 	include/dict0defrag_bg.h
@@ -186,11 +187,9 @@ SET(INNOBASE_SOURCES
 	include/mtr0mtr.h
 	include/mtr0mtr.ic
 	include/mtr0types.h
-	include/os0api.h
 	include/os0event.h
 	include/os0file.h
 	include/os0file.ic
-	include/os0proc.h
 	include/os0thread.h
 	include/page0cur.h
 	include/page0cur.ic
@@ -235,7 +234,7 @@ SET(INNOBASE_SOURCES
 	include/row0upd.h
 	include/row0upd.ic
 	include/row0vers.h
-	include/srv0conc.h
+	include/rw_lock.h
 	include/srv0mon.h
 	include/srv0mon.ic
 	include/srv0srv.h
@@ -244,8 +243,7 @@ SET(INNOBASE_SOURCES
 	include/sync0arr.ic
 	include/sync0debug.h
 	include/sync0policy.h
-	include/sync0rw.h
-	include/sync0rw.ic
+	include/sux_lock.h
 	include/sync0sync.h
 	include/sync0types.h
 	include/trx0i_s.h
@@ -266,7 +264,6 @@ SET(INNOBASE_SOURCES
 	include/ut0byte.h
 	include/ut0byte.ic
 	include/ut0counter.h
-	include/ut0crc32.h
 	include/ut0dbg.h
 	include/ut0list.h
 	include/ut0list.ic
@@ -297,7 +294,6 @@ SET(INNOBASE_SOURCES
 	mem/mem0mem.cc
 	mtr/mtr0mtr.cc
 	os/os0file.cc
-	os/os0proc.cc
 	os/os0event.cc
 	os/os0thread.cc
 	page/page0cur.cc
@@ -328,12 +324,11 @@ SET(INNOBASE_SOURCES
 	row/row0upd.cc
 	row/row0quiesce.cc
 	row/row0vers.cc
-	srv/srv0conc.cc
 	srv/srv0mon.cc
 	srv/srv0srv.cc
 	srv/srv0start.cc
+	sync/srw_lock.cc
 	sync/sync0arr.cc
-	sync/sync0rw.cc
 	sync/sync0debug.cc
 	sync/sync0sync.cc
 	trx/trx0i_s.cc
@@ -344,7 +339,6 @@ SET(INNOBASE_SOURCES
 	trx/trx0sys.cc
 	trx/trx0trx.cc
 	trx/trx0undo.cc
-	ut/ut0crc32.cc
 	ut/ut0dbg.cc
 	ut/ut0list.cc
 	ut/ut0mem.cc

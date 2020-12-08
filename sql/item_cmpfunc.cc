@@ -321,19 +321,18 @@ static bool convert_const_to_int(THD *thd, Item_field *field_item,
   if ((*item)->const_item() && !(*item)->is_expensive())
   {
     TABLE *table= field->table;
-    sql_mode_t orig_sql_mode= thd->variables.sql_mode;
-    enum_check_fields orig_count_cuted_fields= thd->count_cuted_fields;
+    Sql_mode_save sql_mode(thd);
+    Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
     my_bitmap_map *old_maps[2] = { NULL, NULL };
     ulonglong UNINIT_VAR(orig_field_val); /* original field value if valid */
 
     /* table->read_set may not be set if we come here from a CREATE TABLE */
     if (table && table->read_set)
-      dbug_tmp_use_all_columns(table, old_maps, 
+      dbug_tmp_use_all_columns(table, old_maps,
                                table->read_set, table->write_set);
     /* For comparison purposes allow invalid dates like 2000-01-32 */
-    thd->variables.sql_mode= (orig_sql_mode & ~MODE_NO_ZERO_DATE) | 
+    thd->variables.sql_mode= (thd->variables.sql_mode & ~MODE_NO_ZERO_DATE) |
                              MODE_INVALID_DATES;
-    thd->count_cuted_fields= CHECK_FIELD_IGNORE;
 
     /*
       Store the value of the field/constant because the call to save_in_field
@@ -370,8 +369,6 @@ static bool convert_const_to_int(THD *thd, Item_field *field_item,
       /* orig_field_val must be a valid value that can be restored back. */
       DBUG_ASSERT(!result);
     }
-    thd->variables.sql_mode= orig_sql_mode;
-    thd->count_cuted_fields= orig_count_cuted_fields;
     if (table && table->read_set)
       dbug_tmp_restore_column_maps(table->read_set, table->write_set, old_maps);
   }
@@ -868,6 +865,8 @@ int Arg_comparator::compare_decimal()
     {
       if (set_null)
         owner->null_value= 0;
+      val1.round_self_if_needed((*a)->decimals, HALF_UP);
+      val2.round_self_if_needed((*b)->decimals, HALF_UP);
       return val1.cmp(val2);
     }
   }
@@ -890,6 +889,8 @@ int Arg_comparator::compare_e_decimal()
   VDec val1(*a), val2(*b);
   if (val1.is_null() || val2.is_null())
     return MY_TEST(val1.is_null() && val2.is_null());
+  val1.round_self_if_needed((*a)->decimals, HALF_UP);
+  val2.round_self_if_needed((*b)->decimals, HALF_UP);
   return MY_TEST(val1.cmp(val2) == 0);
 }
 
@@ -1197,11 +1198,9 @@ longlong Item_func_truth::val_int()
 }
 
 
-bool Item_in_optimizer::is_top_level_item()
+bool Item_in_optimizer::is_top_level_item() const
 {
-  if (invisible_mode())
-    return FALSE;
-  return ((Item_in_subselect *)args[1])->is_top_level_item();
+  return args[1]->is_top_level_item();
 }
 
 
@@ -1265,10 +1264,9 @@ void Item_in_optimizer::print(String *str, enum_query_type query_type)
 
 void Item_in_optimizer::restore_first_argument()
 {
-  if (!invisible_mode())
-  {
-    args[0]= ((Item_in_subselect *)args[1])->left_expr;
-  }
+  Item_in_subselect *in_subs= args[1]->get_IN_subquery();
+  if (in_subs)
+    args[0]= in_subs->left_exp();
 }
 
 
@@ -1292,8 +1290,8 @@ bool Item_in_optimizer::fix_left(THD *thd)
        the pointer to the post-transformation item. Because of that, on the
        next execution we need to copy args[1]->left_expr again.
     */
-    ref0= &(((Item_in_subselect *)args[1])->left_expr);
-    args[0]= ((Item_in_subselect *)args[1])->left_expr;
+    ref0= args[1]->get_IN_subquery()->left_exp_ptr();
+    args[0]= (*ref0);
   }
   if ((*ref0)->fix_fields_if_needed(thd, ref0) ||
       (!cache && !(cache= (*ref0)->get_cache(thd))))
@@ -1407,7 +1405,7 @@ bool Item_in_optimizer::fix_fields(THD *thd, Item **ref)
   @note 
    Item_in_optimizer should work as pass-through for
     - subqueries that were processed by ALL/ANY->MIN/MAX rewrite
-    - subqueries taht were originally EXISTS subqueries (and were coverted by
+    - subqueries that were originally EXISTS subqueries (and were coinverted by
       the EXISTS->IN rewrite)
 
    When Item_in_optimizer is not not working as a pass-through, it
@@ -1419,9 +1417,7 @@ bool Item_in_optimizer::fix_fields(THD *thd, Item **ref)
 bool Item_in_optimizer::invisible_mode()
 {
   /* MAX/MIN transformed or EXISTS->IN prepared => do nothing */
- return (args[1]->type() != Item::SUBSELECT_ITEM ||
-         ((Item_subselect *)args[1])->substype() ==
-         Item_subselect::EXISTS_SUBS);
+  return (args[1]->get_IN_subquery() == NULL);
 }
 
 
@@ -1583,7 +1579,7 @@ longlong Item_in_optimizer::val_int()
       "<outer_value_list> [NOT] IN (SELECT <inner_value_list>...)" 
       where one or more of the outer values is NULL. 
     */
-    if (((Item_in_subselect*)args[1])->is_top_level_item())
+    if (args[1]->is_top_level_item())
     {
       /*
         We're evaluating a top level item, e.g. 
@@ -1606,7 +1602,7 @@ longlong Item_in_optimizer::val_int()
         SELECT evaluated over the non-NULL values produces at least
         one row, FALSE otherwise
       */
-      Item_in_subselect *item_subs=(Item_in_subselect*)args[1]; 
+      Item_in_subselect *item_subs= args[1]->get_IN_subquery();
       bool all_left_cols_null= true;
       const uint ncols= cache->cols();
 
@@ -1752,8 +1748,7 @@ Item *Item_in_optimizer::transform(THD *thd, Item_transformer transformer,
                  ((Item_subselect*)(args[1]))->substype() ==
                  Item_subselect::ANY_SUBS));
 
-    Item_in_subselect *in_arg= (Item_in_subselect*)args[1];
-    thd->change_item_tree(&in_arg->left_expr, args[0]);
+    thd->change_item_tree(args[1]->get_IN_subquery()->left_exp_ptr(), args[0]);
   }
   return (this->*transformer)(thd, argument);
 }
@@ -1997,8 +1992,8 @@ longlong Item_func_interval::val_int()
       interval_range *range= intervals + mid;
       my_bool cmp_result;
       /*
-        The values in the range intervall may have different types,
-        Only do a decimal comparision of the first argument is a decimal
+        The values in the range interval may have different types,
+        Only do a decimal comparison if the first argument is a decimal
         and we are comparing against a decimal
       */
       if (dec && range->type == DECIMAL_RESULT)
@@ -2337,7 +2332,7 @@ longlong Item_func_between::val_int_cmp_real()
 
 void Item_func_between::print(String *str, enum_query_type query_type)
 {
-  args[0]->print_parenthesised(str, query_type, precedence());
+  args[0]->print_parenthesised(str, query_type, higher_precedence());
   if (negated)
     str->append(STRING_WITH_LEN(" not"));
   str->append(STRING_WITH_LEN(" between "));
@@ -2640,7 +2635,7 @@ Item_func_nullif::fix_length_and_dec()
       Some examples of what NULLIF can end up with after argument
       substitution (we don't mention args[1] in some cases for simplicity):
 
-      1. l_expr is not an aggragate function:
+      1. l_expr is not an aggregate function:
 
         a. No conversion happened.
            args[0] and args[2] were not replaced to something else
@@ -2764,7 +2759,7 @@ Item_func_nullif::fix_length_and_dec()
     In this case we remember and reuse m_arg0 during EXECUTE time as args[2].
 
     QQ: How to make sure that m_args0 does not point
-    to something temporary which will be destoyed between PREPARE and EXECUTE.
+    to something temporary which will be destroyed between PREPARE and EXECUTE.
     The condition below should probably be more strict and somehow check that:
     - change_item_tree() was called for the new args[0]
     - m_args0 is referenced from inside args[0], e.g. as a function argument,
@@ -3354,27 +3349,28 @@ Item* Item_func_case_simple::propagate_equal_fields(THD *thd,
 }
 
 
-void Item_func_case::print_when_then_arguments(String *str,
-                                               enum_query_type query_type,
-                                               Item **items, uint count)
+inline void Item_func_case::print_when_then_arguments(String *str,
+                                                      enum_query_type
+                                                      query_type,
+                                                      Item **items, uint count)
 {
-  for (uint i=0 ; i < count ; i++)
+  for (uint i= 0; i < count; i++)
   {
     str->append(STRING_WITH_LEN("when "));
-    items[i]->print_parenthesised(str, query_type, precedence());
+    items[i]->print(str, query_type);
     str->append(STRING_WITH_LEN(" then "));
-    items[i + count]->print_parenthesised(str, query_type, precedence());
+    items[i + count]->print(str, query_type);
     str->append(' ');
   }
 }
 
 
-void Item_func_case::print_else_argument(String *str,
-                                         enum_query_type query_type,
-                                         Item *item)
+inline void Item_func_case::print_else_argument(String *str,
+                                                enum_query_type query_type,
+                                                Item *item)
 {
   str->append(STRING_WITH_LEN("else "));
-  item->print_parenthesised(str, query_type, precedence());
+  item->print(str, query_type);
   str->append(' ');
 }
 
@@ -5606,12 +5602,14 @@ void Item_func_like::print(String *str, enum_query_type query_type)
     str->append(STRING_WITH_LEN(" not "));
   str->append(func_name());
   str->append(' ');
-  args[1]->print_parenthesised(str, query_type, precedence());
   if (escape_used_in_parsing)
   {
+    args[1]->print_parenthesised(str, query_type, precedence());
     str->append(STRING_WITH_LEN(" escape "));
-    escape_item->print(str, query_type);
+    escape_item->print_parenthesised(str, query_type, higher_precedence());
   }
+  else
+    args[1]->print_parenthesised(str, query_type, higher_precedence());
 }
 
 
@@ -7307,7 +7305,7 @@ Item* Item_equal::get_first(JOIN_TAB *context, Item *field_item)
     and not ot2.col.
     
     eliminate_item_equal() also has code that deals with equality substitution
-    in presense of SJM nests.
+    in presence of SJM nests.
   */
 
   TABLE_LIST *emb_nest;

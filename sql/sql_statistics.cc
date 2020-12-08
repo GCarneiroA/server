@@ -2123,8 +2123,8 @@ int alloc_statistics_for_table(THD* thd, TABLE *table)
                                     sizeof(Index_statistics) * keys);
 
   uint key_parts= table->s->ext_key_parts;
-  ulong *idx_avg_frequency= (ulong*) alloc_root(&table->mem_root,
-                                                sizeof(ulong) * key_parts);
+  ulonglong *idx_avg_frequency= (ulonglong*) alloc_root(&table->mem_root,
+                                               sizeof(ulonglong) * key_parts);
 
   uint columns= 0;
   for (field_ptr= table->field; *field_ptr; field_ptr++)
@@ -2169,7 +2169,7 @@ int alloc_statistics_for_table(THD* thd, TABLE *table)
     }
   }
 
-  memset(idx_avg_frequency, 0, sizeof(ulong) * key_parts);
+  memset(idx_avg_frequency, 0, sizeof(ulonglong) * key_parts);
 
   KEY *key_info, *end;
   for (key_info= table->key_info, end= key_info + table->s->keys;
@@ -2285,14 +2285,14 @@ static int alloc_statistics_for_table_share(THD* thd, TABLE_SHARE *table_share)
   }
 
   uint key_parts= table_share->ext_key_parts;
-  ulong *idx_avg_frequency=  table_stats->idx_avg_frequency;
+  ulonglong *idx_avg_frequency=  table_stats->idx_avg_frequency;
   if (!idx_avg_frequency)
   {
-    idx_avg_frequency= (ulong*) alloc_root(&stats_cb->mem_root,
-                                           sizeof(ulong) * key_parts);
+    idx_avg_frequency= (ulonglong*) alloc_root(&stats_cb->mem_root,
+                                               sizeof(ulonglong) * key_parts);
     if (idx_avg_frequency)
     {
-      memset(idx_avg_frequency, 0, sizeof(ulong) * key_parts);
+      memset(idx_avg_frequency, 0, sizeof(ulonglong) * key_parts);
       table_stats->idx_avg_frequency= idx_avg_frequency;
       for (key_info= table_share->key_info, end= key_info + keys;
            key_info < end; 
@@ -2899,7 +2899,6 @@ int read_statistics_for_table(THD *thd, TABLE *table, TABLE_LIST *stat_tables)
   Field **field_ptr;
   KEY *key_info, *key_info_end;
   TABLE_SHARE *table_share= table->s;
-  enum_check_fields old_check_level= thd->count_cuted_fields;
 
   DBUG_ENTER("read_statistics_for_table");
   DEBUG_SYNC(thd, "statistics_mem_alloc_start1");
@@ -2915,7 +2914,7 @@ int read_statistics_for_table(THD *thd, TABLE *table, TABLE_LIST *stat_tables)
   }
 
   /* Don't write warnings for internal field conversions */
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
 
   /* Read statistics from the statistical table table_stats */
   Table_statistics *read_stats= table_share->stats_cb.table_stats;
@@ -2997,7 +2996,6 @@ int read_statistics_for_table(THD *thd, TABLE *table, TABLE_LIST *stat_tables)
     }
   }
 
-  thd->count_cuted_fields= old_check_level;
   table_share->stats_cb.end_stats_load();
   DBUG_RETURN(0);
 }

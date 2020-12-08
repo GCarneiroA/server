@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2017, Oracle and/or its affiliates.
-   Copyright (c) 2010, 2017, Corporation
+   Copyright (c) 2010, 2020, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -880,6 +880,10 @@ bool select_unit_ext::send_eof()
     table->file->ha_rnd_end();
   }
 
+  /* Clean up table buffers for the next set operation from pipeline */
+  if (next_sl)
+    restore_record(table,s->default_values);
+
   if (unlikely(error))
     table->file->print_error(error, MYF(0));
 
@@ -1364,6 +1368,25 @@ bool st_select_lex_unit::prepare(TABLE_LIST *derived_arg,
   found_rows_for_union= first_sl->options & OPTION_FOUND_ROWS;
   is_union_select= is_unit_op() || fake_select_lex || single_tvc;
 
+  /*
+    If we are reading UNION output and the UNION is in the
+    IN/ANY/ALL/EXISTS subquery, then ORDER BY is redundant and hence should
+    be removed.
+    Example:
+     select ... col IN (select col2 FROM t1 union select col3 from t2 ORDER BY 1)
+
+    (as for ORDER BY ... LIMIT, it currently not supported inside
+     IN/ALL/ANY subqueries)
+    (For non-UNION this removal of ORDER BY clause is done in
+     check_and_do_in_subquery_rewrites())
+  */
+  if (item && is_unit_op() &&
+      (item->is_in_predicate() || item->is_exists_predicate()))
+  {
+    global_parameters()->order_list.first= NULL;
+    global_parameters()->order_list.elements= 0;
+  }
+
   /* will only optimize once */
   if (!bag_set_op_optimized && !is_recursive)
   {
@@ -1390,6 +1413,7 @@ bool st_select_lex_unit::prepare(TABLE_LIST *derived_arg,
       break;
     }
   }
+
   /* Global option */
 
   if (is_union_select || is_recursive)
@@ -2521,13 +2545,7 @@ bool st_select_lex_unit::cleanup()
   {
     DBUG_RETURN(FALSE);
   }
-  /*
-    When processing a PS/SP or an EXPLAIN command cleanup of a unit can
-    be performed immediately when the unit is reached in the cleanup
-    traversal initiated by the cleanup of the main unit.
-  */
-  if (!thd->stmt_arena->is_stmt_prepare() && !thd->lex->describe &&
-      with_element && with_element->is_recursive && union_result)
+  if (with_element && with_element->is_recursive && union_result)
   {
     select_union_recursive *result= with_element->rec_result;
     if (++result->cleanup_count == with_element->rec_outer_references)
@@ -2701,33 +2719,40 @@ bool st_select_lex::cleanup()
   bool error= FALSE;
   DBUG_ENTER("st_select_lex::cleanup()");
 
+  DBUG_PRINT("info", ("select: %p (%u)  JOIN %p",
+                      this, select_number, join));
   cleanup_order(order_list.first);
   cleanup_order(group_list.first);
   cleanup_ftfuncs(this);
 
   if (join)
   {
+    List_iterator<TABLE_LIST> ti(leaf_tables);
+    TABLE_LIST *tbl;
+    while ((tbl= ti++))
+    {
+      if (tbl->is_recursive_with_table() &&
+          !tbl->is_with_table_recursive_reference())
+      {
+        /*
+          If query is killed before open_and_process_table() for tbl
+          is called then 'with' is already set, but 'derived' is not.
+        */
+        st_select_lex_unit *unit= tbl->with->spec;
+        error|= (bool) error | (uint) unit->cleanup();
+      }
+    }
     DBUG_ASSERT((st_select_lex*)join->select_lex == this);
     error= join->destroy();
     delete join;
     join= 0;
   }
-  for (TABLE_LIST *tbl= get_table_list(); tbl; tbl= tbl->next_local)
-  {
-    if (tbl->is_recursive_with_table() &&
-        !tbl->is_with_table_recursive_reference())
-    {
-      /*
-        If query is killed before open_and_process_table() for tbl
-        is called then 'with' is already set, but 'derived' is not.
-      */
-      st_select_lex_unit *unit= tbl->with->spec;
-      error|= (bool) error | (uint) unit->cleanup();
-    }
-  }
+  leaf_tables.empty();
   for (SELECT_LEX_UNIT *lex_unit= first_inner_unit(); lex_unit ;
        lex_unit= lex_unit->next_unit())
   {
+    if (lex_unit->with_element && lex_unit->with_element->is_recursive)
+      continue;
     error= (bool) ((uint) error | (uint) lex_unit->cleanup());
   }
   inner_refs_list.empty();
@@ -2747,8 +2772,12 @@ void st_select_lex::cleanup_all_joins(bool full)
     join->cleanup(full);
 
   for (unit= first_inner_unit(); unit; unit= unit->next_unit())
+  {
+    if (unit->with_element && unit->with_element->is_recursive)
+      continue;
     for (sl= unit->first_select(); sl; sl= sl->next_select())
       sl->cleanup_all_joins(full);
+  }
   DBUG_VOID_RETURN;
 }
 

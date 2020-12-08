@@ -222,18 +222,6 @@ public:
   inline bool is_empty() const { return (str_length == 0); }
   inline const char *ptr() const { return Ptr; }
   inline const char *end() const { return Ptr + str_length; }
-
-  LEX_STRING lex_string() const
-  {
-    LEX_STRING str = { (char*) ptr(), length() };
-    return str;
-  }
-  LEX_CSTRING lex_cstring() const
-  {
-    LEX_CSTRING skr = { ptr(), length() };
-    return skr;
-  }
-
   bool has_8bit_bytes() const
   {
     for (const char *c= ptr(), *c_end= end(); c < c_end; c++)
@@ -326,7 +314,8 @@ public:
   }
   void q_append(const char *data, size_t data_len)
   {
-    memcpy(Ptr + str_length, data, data_len);
+    if (data_len)
+      memcpy(Ptr + str_length, data, data_len);
     DBUG_ASSERT(str_length <= UINT_MAX32 - data_len);
     str_length += (uint)data_len;
   }
@@ -357,7 +346,7 @@ public:
   void qs_append(const char *str, size_t len);
   void qs_append_hex(const char *str, uint32 len);
   void qs_append(double d);
-  void qs_append(double *d);
+  void qs_append(const double *d);
   inline void qs_append(const char c)
   {
      Ptr[str_length]= c;
@@ -488,6 +477,12 @@ public:
     if (str.Alloced_length)
       Alloced_length= (uint32) (str.Alloced_length - offset);
   }
+  inline LEX_CSTRING *get_value(LEX_CSTRING *res)
+  {
+    res->str=    Ptr;
+    res->length= str_length;
+    return res;
+  }
 
   /* Take over handling of buffer from some other object */
   void reset(char *ptr_arg, size_t length_arg, size_t alloced_length_arg)
@@ -530,6 +525,7 @@ public:
 
   bool set_hex(ulonglong num);
   bool set_hex(const char *str, uint32 len);
+  bool set_fcvt(double num, uint decimals);
 
   bool copy();                                  // Alloc string if not alloced
   bool copy(const Binary_string &s);            // Allocate new string
@@ -787,6 +783,11 @@ public:
   bool set(longlong num, CHARSET_INFO *cs) { return set_int(num, false, cs); }
   bool set(ulonglong num, CHARSET_INFO *cs) { return set_int((longlong)num, true, cs); }
   bool set_real(double num,uint decimals, CHARSET_INFO *cs);
+  bool set_fcvt(double num, uint decimals)
+  {
+    set_charset(&my_charset_latin1);
+    return Binary_string::set_fcvt(num, decimals);
+  }
 
   bool set_hex(ulonglong num)
   {
@@ -888,13 +889,13 @@ public:
   {
     return Binary_string::append_hex((const char*)src, srclen);
   }
-  bool append_introducer_and_hex(CHARSET_INFO *cs, const LEX_CSTRING &str)
+  bool append_introducer_and_hex(const String *str)
   {
     return
       append(STRING_WITH_LEN("_"))   ||
-      append(cs->csname)             ||
+      append(str->charset()->csname)  ||
       append(STRING_WITH_LEN(" 0x")) ||
-      append_hex(str.str, (uint32) str.length);
+      append_hex(str->ptr(), (uint32) str->length());
   }
   bool append(IO_CACHE* file, uint32 arg_length)
   {

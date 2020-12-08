@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1996, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2019, MariaDB Corporation.
+Copyright (c) 2017, 2020, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -46,10 +46,9 @@ Created 3/26/1996 Heikki Tuuri
 /** Checks if a page address is the trx sys header page.
 @param[in]	page_id	page id
 @return true if trx sys header page */
-inline bool trx_sys_hdr_page(const page_id_t& page_id)
+inline bool trx_sys_hdr_page(const page_id_t page_id)
 {
-	return(page_id.space() == TRX_SYS_SPACE
-	       && page_id.page_no() == TRX_SYS_PAGE_NO);
+  return page_id == page_id_t(TRX_SYS_SPACE, TRX_SYS_PAGE_NO);
 }
 
 /*****************************************************************//**
@@ -69,10 +68,8 @@ trx_sys_rseg_find_free(const buf_block_t* sys_header);
 @retval	NULL	if the page cannot be read */
 inline buf_block_t *trx_sysf_get(mtr_t* mtr, bool rw= true)
 {
-  buf_block_t* block = buf_page_get(page_id_t(TRX_SYS_SPACE, TRX_SYS_PAGE_NO),
-				    0, rw ? RW_X_LATCH : RW_S_LATCH, mtr);
-  ut_d(if (block) buf_block_dbg_add_level(block, SYNC_TRX_SYS_HEADER);)
-  return block;
+  return buf_page_get(page_id_t(TRX_SYS_SPACE, TRX_SYS_PAGE_NO),
+                      0, rw ? RW_X_LATCH : RW_S_LATCH, mtr);
 }
 
 #ifdef UNIV_DEBUG
@@ -340,9 +337,6 @@ FIL_PAGE_ARCH_LOG_NO_OR_SPACE_ID. */
 constexpr uint32_t TRX_SYS_DOUBLEWRITE_MAGIC_N= 536853855;
 /** Contents of TRX_SYS_DOUBLEWRITE_SPACE_ID_STORED */
 constexpr uint32_t TRX_SYS_DOUBLEWRITE_SPACE_ID_STORED_N= 1783657386;
-
-/** Size of the doublewrite block in pages */
-#define TRX_SYS_DOUBLEWRITE_BLOCK_SIZE	FSP_EXTENT_SIZE
 /* @} */
 
 trx_t* current_trx();
@@ -572,7 +566,7 @@ public:
     Releases LF_HASH pins.
 
     Must be called by thread that owns trx_t object when the latter is being
-    "detached" from thread (e.g. released to the pool by trx_free()). Can be
+    "detached" from thread (e.g. released to the pool by trx_t::free()). Can be
     called earlier if thread is expected not to use rw_trx_hash.
 
     Since pins are not allowed to be transferred to another thread,
@@ -660,11 +654,8 @@ public:
             trx->mutex is released, and it will have to be rechecked
             by the caller after reacquiring the mutex.
           */
-          trx_mutex_enter(trx);
-          const trx_state_t state= trx->state;
-          trx_mutex_exit(trx);
-          if (state == TRX_STATE_COMMITTED_IN_MEMORY)
-            trx= NULL;
+          if (trx->state == TRX_STATE_COMMITTED_IN_MEMORY)
+            trx= nullptr;
           else
             trx->reference();
         }

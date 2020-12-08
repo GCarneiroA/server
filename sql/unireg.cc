@@ -86,6 +86,13 @@ static uchar* extra2_write_str(uchar *pos, const LEX_CSTRING &str)
   return pos + str.length;
 }
 
+static uchar* extra2_write_str(uchar *pos, const Binary_string *str)
+{
+  pos= extra2_write_len(pos, str->length());
+  memcpy(pos, str->ptr(), str->length());
+  return pos + str->length();
+}
+
 static uchar *extra2_write(uchar *pos, enum extra2_frm_value_type type,
                            const LEX_CSTRING &str)
 {
@@ -178,11 +185,11 @@ class Field_data_type_info_image: public BinaryStringBuffer<512>
   {
     return net_store_length(pos, length);
   }
-  static uchar *store_string(uchar *pos, const LEX_CSTRING &str)
+  static uchar *store_string(uchar *pos, const Binary_string *str)
   {
-    pos= store_length(pos, str.length);
-    memcpy(pos, str.str, str.length);
-    return pos + str.length;
+    pos= store_length(pos, str->length());
+    memcpy(pos, str->ptr(), str->length());
+    return pos + str->length();
   }
   static uint store_length_required_length(ulonglong length)
   {
@@ -206,7 +213,7 @@ public:
       return true; // Error
     uchar *pos= (uchar *) end();
     pos= store_length(pos, fieldnr);
-    pos= store_string(pos, type_info.lex_cstring());
+    pos= store_string(pos, &type_info);
     size_t new_length= (const char *) pos - ptr();
     DBUG_ASSERT(new_length < alloced_length());
     length((uint32) new_length);
@@ -471,7 +478,7 @@ LEX_CUSTRING build_frm_image(THD *thd, const LEX_CSTRING &table,
       goto err;
     }
     *pos= EXTRA2_FIELD_DATA_TYPE_INFO;
-    pos= extra2_write_str(pos + 1, field_data_type_info_image.lex_cstring());
+    pos= extra2_write_str(pos + 1, &field_data_type_info_image);
   }
 
   // PERIOD
@@ -1097,8 +1104,11 @@ static bool pack_fields(uchar **buff_arg, List<Create_field> &create_fields,
     it.rewind();
     while ((field=it++))
     {
-      memcpy(buff, field->comment.str, field->comment.length);
-      buff+= field->comment.length;
+      if (size_t l= field->comment.length)
+      {
+        memcpy(buff, field->comment.str, l);
+        buff+= l;
+      }
     }
   }
   *buff_arg= buff;
@@ -1141,7 +1151,6 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
   TABLE table;
   TABLE_SHARE share;
   Create_field *field;
-  enum_check_fields old_count_cuted_fields= thd->count_cuted_fields;
   DBUG_ENTER("make_empty_rec");
 
   /* We need a table to generate columns for default values */
@@ -1160,7 +1169,7 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
   null_pos= buff;
 
   List_iterator<Create_field> it(create_fields);
-  thd->count_cuted_fields= CHECK_FIELD_WARN;    // To find wrong default values
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_WARN);
   while ((field=it++))
   {
     Record_addr addr(buff + field->offset + data_offset,
@@ -1207,6 +1216,5 @@ static bool make_empty_rec(THD *thd, uchar *buff, uint table_options,
     *(null_pos + null_count / 8)|= ~(((uchar) 1 << (null_count & 7)) - 1);
 
 err:
-  thd->count_cuted_fields= old_count_cuted_fields;
   DBUG_RETURN(error);
 } /* make_empty_rec */

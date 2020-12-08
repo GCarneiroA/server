@@ -439,11 +439,14 @@ bool handle_select(THD *thd, LEX *lex, select_result *result,
       If LIMIT ROWS EXAMINED interrupted query execution, issue a warning,
       continue with normal processing and produce an incomplete query result.
     */
+    bool saved_abort_on_warning= thd->abort_on_warning;
+    thd->abort_on_warning= false;
     push_warning_printf(thd, Sql_condition::WARN_LEVEL_WARN,
                         ER_QUERY_EXCEEDED_ROWS_EXAMINED_LIMIT,
                         ER_THD(thd, ER_QUERY_EXCEEDED_ROWS_EXAMINED_LIMIT),
                         thd->accessed_rows_and_keys,
                         thd->lex->limit_rows_examined->val_uint());
+    thd->abort_on_warning= saved_abort_on_warning;
     thd->reset_killed();
   }
   /* Disable LIMIT ROWS EXAMINED after query execution. */
@@ -729,8 +732,9 @@ bool vers_select_conds_t::init_from_sysvar(THD *thd)
   if (type != SYSTEM_TIME_UNSPECIFIED && type != SYSTEM_TIME_ALL)
   {
     DBUG_ASSERT(type == SYSTEM_TIME_AS_OF);
+    Datetime dt(&in.ltime);
     start.item= new (thd->mem_root)
-        Item_datetime_literal(thd, &in.ltime, TIME_SECOND_PART_DIGITS);
+        Item_datetime_literal(thd, &dt, TIME_SECOND_PART_DIGITS);
     if (!start.item)
       return true;
   }
@@ -742,7 +746,7 @@ bool vers_select_conds_t::init_from_sysvar(THD *thd)
 
 void vers_select_conds_t::print(String *str, enum_query_type query_type) const
 {
-  switch (type) {
+  switch (orig_type) {
   case SYSTEM_TIME_UNSPECIFIED:
     break;
   case SYSTEM_TIME_AS_OF:
@@ -794,15 +798,17 @@ Item* period_get_condition(THD *thd, TABLE_LIST *table, SELECT_LEX *select,
     {
     case SYSTEM_TIME_UNSPECIFIED:
     case SYSTEM_TIME_HISTORY:
+    {
       thd->variables.time_zone->gmt_sec_to_TIME(&max_time, TIMESTAMP_MAX_VALUE);
       max_time.second_part= TIME_MAX_SECOND_PART;
-      curr= newx Item_datetime_literal(thd, &max_time, TIME_SECOND_PART_DIGITS);
+      Datetime dt(&max_time);
+      curr= newx Item_datetime_literal(thd, &dt, TIME_SECOND_PART_DIGITS);
       if (conds->type == SYSTEM_TIME_UNSPECIFIED)
         cond1= newx Item_func_eq(thd, conds->field_end, curr);
       else
         cond1= newx Item_func_lt(thd, conds->field_end, curr);
       break;
-      break;
+    }
     case SYSTEM_TIME_AS_OF:
       cond1= newx Item_func_le(thd, conds->field_start, conds->start.item);
       cond2= newx Item_func_gt(thd, conds->field_end, conds->start.item);
@@ -988,6 +994,7 @@ int SELECT_LEX::vers_setup_conds(THD *thd, TABLE_LIST *tables)
   case SQLCOM_SELECT:
     use_sysvar= true;
     /* fall through */
+  case SQLCOM_CREATE_TABLE:
   case SQLCOM_INSERT_SELECT:
   case SQLCOM_REPLACE_SELECT:
   case SQLCOM_DELETE_MULTI:
@@ -1134,6 +1141,8 @@ JOIN::prepare(TABLE_LIST *tables_init, COND *conds_init, uint og_num,
   proc_param= proc_param_init;
   tables_list= tables_init;
   select_lex= select_lex_arg;
+  DBUG_PRINT("info", ("select %p (%u) = JOIN %p",
+                      select_lex, select_lex->select_number, this));
   select_lex->join= this;
   join_list= &select_lex->top_join_list;
   union_part= unit_arg->is_unit_op();
@@ -1425,7 +1434,7 @@ JOIN::prepare(TABLE_LIST *tables_init, COND *conds_init, uint og_num,
   if (thd->variables.sql_mode & MODE_ONLY_FULL_GROUP_BY && !group_list &&
       !(select_lex->master_unit()->item &&
         select_lex->master_unit()->item->is_in_predicate() &&
-        ((Item_in_subselect*)select_lex->master_unit()->item)->
+        select_lex->master_unit()->item->get_IN_subquery()->
         test_set_strategy(SUBS_MAXMIN_INJECTED)) &&
       select_lex->non_agg_field_used() &&
       select_lex->agg_func_used())
@@ -1552,7 +1561,6 @@ err:
 bool JOIN::build_explain()
 {
   DBUG_ENTER("JOIN::build_explain");
-  create_explain_query_if_not_exists(thd->lex, thd->mem_root);
   have_query_plan= QEP_AVAILABLE;
 
   /*
@@ -1594,6 +1602,7 @@ bool JOIN::build_explain()
 int JOIN::optimize()
 {
   int res= 0;
+  create_explain_query_if_not_exists(thd->lex, thd->mem_root);
   join_optimization_state init_state= optimization_state;
   if (select_lex->pushdown_select)
   {
@@ -1603,7 +1612,7 @@ int JOIN::optimize()
     if (!(select_options & SELECT_DESCRIBE))
     {
       /* Prepare to execute the query pushed into a foreign engine */
-      res= select_lex->pushdown_select->init();
+      res= select_lex->pushdown_select->prepare();
     }
     with_two_phase_optimization= false;
   }
@@ -2776,6 +2785,10 @@ int JOIN::optimize_stage2()
     (select_options & (SELECT_DESCRIBE | SELECT_NO_JOIN_CACHE)) |
     (select_lex->ftfunc_list->elements ?  SELECT_NO_JOIN_CACHE : 0);
 
+  if (select_lex->options & OPTION_SCHEMA_TABLE &&
+       optimize_schema_tables_reads(this))
+    DBUG_RETURN(1);
+
   if (make_join_readinfo(this, select_opts_for_readinfo, no_jbuf_after))
     DBUG_RETURN(1);
 
@@ -2951,10 +2964,6 @@ int JOIN::optimize_stage2()
   if (having)
     having_is_correlated= MY_TEST(having->used_tables() & OUTER_REF_TABLE_BIT);
   tmp_having= having;
-
-  if ((select_lex->options & OPTION_SCHEMA_TABLE) &&
-       optimize_schema_tables_reads(this))
-    DBUG_RETURN(TRUE);
 
   if (unlikely(thd->is_error()))
     DBUG_RETURN(TRUE);
@@ -3738,14 +3747,16 @@ JOIN::create_postjoin_aggr_table(JOIN_TAB *tab, List<Item> *table_fields,
   tab->tmp_table_param->skip_create_table= true;
   TABLE* table= create_tmp_table(thd, tab->tmp_table_param, *table_fields,
                                  table_group, distinct,
-                                 save_sum_fields, select_options, table_rows_limit, 
+                                 save_sum_fields, select_options,
+                                 table_rows_limit,
                                  &empty_clex_str, true, keep_row_order);
   if (!table)
     DBUG_RETURN(true);
   tmp_table_param.using_outer_summary_function=
     tab->tmp_table_param->using_outer_summary_function;
   tab->join= this;
-  DBUG_ASSERT(tab > tab->join->join_tab || !top_join_tab_count || !tables_list);
+  DBUG_ASSERT(tab > tab->join->join_tab || !top_join_tab_count ||
+              !tables_list);
   if (tab > join_tab)
     (tab - 1)->next_select= sub_select_postjoin_aggr;
   if (!(tab->aggr= new (thd->mem_root) AGGR_OP(tab)))
@@ -4261,8 +4272,9 @@ void JOIN::exec_inner()
   /*
     Enable LIMIT ROWS EXAMINED during query execution if:
     (1) This JOIN is the outermost query (not a subquery or derived table)
-        This ensures that the limit is enabled when actual execution begins, and
-        not if a subquery is evaluated during optimization of the outer query.
+        This ensures that the limit is enabled when actual execution begins,
+        and not if a subquery is evaluated during optimization of the outer
+        query.
     (2) This JOIN is not the result of a UNION. In this case do not apply the
         limit in order to produce the partial query result stored in the
         UNION temp table.
@@ -4478,6 +4490,9 @@ int
 JOIN::destroy()
 {
   DBUG_ENTER("JOIN::destroy");
+
+  DBUG_PRINT("info", ("select %p (%u) <> JOIN %p",
+                      select_lex, select_lex->select_number, this));
   select_lex->join= 0;
 
   cond_equal= 0;
@@ -4634,19 +4649,7 @@ mysql_select(THD *thd, TABLE_LIST *tables, List<Item> &fields, COND *conds,
   }
 
   /* Look for a table owned by an engine with the select_handler interface */
-  select_lex->select_h= select_lex->find_select_handler(thd);
-  if (select_lex->select_h)
-  {
-    /* Create a Pushdown_select object for later execution of the query */
-    if (!(select_lex->pushdown_select=
-      new (thd->mem_root) Pushdown_select(select_lex,
-                                          select_lex->select_h)))
-    {
-      delete select_lex->select_h;
-      select_lex->select_h= NULL;
-      DBUG_RETURN(TRUE);
-    }
-  }
+  select_lex->pushdown_select= select_lex->find_select_handler(thd);
 
   if ((err= join->optimize()))
   {
@@ -5056,7 +5059,7 @@ make_join_statistics(JOIN *join, List<TABLE_LIST> &tables_list,
     */
     bool skip_unprefixed_keyparts=
       !(join->is_in_subquery() &&
-        ((Item_in_subselect*)join->unit->item)->test_strategy(SUBS_IN_TO_EXISTS));
+        join->unit->item->get_IN_subquery()->test_strategy(SUBS_IN_TO_EXISTS));
 
     if (keyuse_array->elements &&
         sort_and_filter_keyuse(thd, keyuse_array,
@@ -5809,7 +5812,8 @@ static uint get_semi_join_select_list_index(Field *field)
   {
     Item_in_subselect *subq_pred= emb_sj_nest->sj_subq_pred;
     st_select_lex *subq_lex= subq_pred->unit->first_select();
-    if (subq_pred->left_expr->cols() == 1)
+    uint ncols= subq_pred->left_exp()->cols();
+    if (ncols == 1)
     {
       Item *sel_item= subq_lex->ref_pointer_array[0];
       if (sel_item->type() == Item::FIELD_ITEM &&
@@ -5820,7 +5824,7 @@ static uint get_semi_join_select_list_index(Field *field)
     }
     else
     {
-      for (uint i= 0; i < subq_pred->left_expr->cols(); i++)
+      for (uint i= 0; i < ncols; i++)
       {
         Item *sel_item= subq_lex->ref_pointer_array[i];
         if (sel_item->type() == Item::FIELD_ITEM &&
@@ -11596,11 +11600,16 @@ make_join_select(JOIN *join,SQL_SELECT *select,COND *cond)
                   HA_CAN_TABLE_CONDITION_PUSHDOWN) &&
                 !first_inner_tab)
             {
+              Json_writer_object wrap(thd);
+              Json_writer_object trace_cp(thd, "table_condition_pushdown");
+              trace_cp.add_table_name(tab->table);
+
               COND *push_cond= 
               make_cond_for_table(thd, tmp_cond, current_map, current_map,
                                   -1, FALSE, FALSE);
               if (push_cond)
               {
+                trace_cp.add("push_cond", push_cond);
                 /* Push condition to handler */
                 if (!tab->table->file->cond_push(push_cond))
                   tab->table->file->pushed_cond= push_cond;
@@ -13772,6 +13781,9 @@ void JOIN::join_free()
   for (tmp_unit= select_lex->first_inner_unit();
        tmp_unit;
        tmp_unit= tmp_unit->next_unit())
+  {
+    if (tmp_unit->with_element && tmp_unit->with_element->is_recursive)
+      continue;
     for (sl= tmp_unit->first_select(); sl; sl= sl->next_select())
     {
       Item_subselect *subselect= sl->master_unit()->item;
@@ -13789,7 +13801,7 @@ void JOIN::join_free()
       /* Can't unlock if at least one JOIN is still needed */
       can_unlock= can_unlock && full_local;
     }
-
+  }
   /*
     We are not using tables anymore
     Unlock all tables. We may be in an INSERT .... SELECT statement.
@@ -13894,24 +13906,7 @@ void JOIN::cleanup(bool full)
       for (tab= first_linear_tab(this, WITH_BUSH_ROOTS, WITH_CONST_TABLES); tab;
            tab= next_linear_tab(this, tab, WITH_BUSH_ROOTS))
       {
-        if (!tab->table)
-          continue;
-        DBUG_PRINT("info", ("close index: %s.%s  alias: %s",
-                            tab->table->s->db.str,
-                            tab->table->s->table_name.str,
-                            tab->table->alias.c_ptr()));
-	if (tab->table->is_created())
-        {
-          tab->table->file->ha_index_or_rnd_end();
-          if (tab->aggr)
-          {
-            int tmp= 0;
-            if ((tmp= tab->table->file->extra(HA_EXTRA_NO_CACHE)))
-              tab->table->file->print_error(tmp, MYF(0));
-          }
-        }
-        delete tab->filesort_result;
-        tab->filesort_result= NULL;
+        tab->partial_cleanup();
       }
     }
   }
@@ -14109,7 +14104,7 @@ static void update_depend_map_for_order(JOIN *join, ORDER *order)
 
 
 /**
-  Remove all constants and check if ORDER only contains simple
+  Remove all constants from ORDER and check if ORDER only contains simple
   expressions.
 
   We also remove all duplicate expressions, keeping only the first one.
@@ -16654,13 +16649,13 @@ static uint reset_nj_counters(JOIN *join, List<TABLE_LIST> *join_list)
   @verbatim
      IMPLEMENTATION 
        LIMITATIONS ON JOIN ORDER
-         The nested [outer] joins executioner algorithm imposes these limitations
-         on join order:
+         The nested [outer] joins executioner algorithm imposes these
+         limitations on join order:
          1. "Outer tables first" -  any "outer" table must be before any 
              corresponding "inner" table.
-         2. "No interleaving" - tables inside a nested join must form a continuous
-            sequence in join order (i.e. the sequence must not be interrupted by 
-            tables that are outside of this nested join).
+         2. "No interleaving" - tables inside a nested join must form a
+             continuous sequence in join order (i.e. the sequence must not be
+             interrupted by tables that are outside of this nested join).
 
          #1 is checked elsewhere, this function checks #2 provided that #1 has
          been already checked.
@@ -16672,34 +16667,36 @@ static uint reset_nj_counters(JOIN *join, List<TABLE_LIST> *join_list)
 
          The join order "t1 t2 t0 t3" is invalid:
 
-         table t0 is outside of the nested join, so WHERE condition for t0 is
-         attached directly to t0 (without triggers, and it may be used to access
-         t0). Applying WHERE(t0) to (t2,t0,t3) record is invalid as we may miss
-         combinations of (t1, t2, t3) that satisfy condition cond1, and produce a
-         null-complemented (t1, t2.NULLs, t3.NULLs) row, which should not have
-         been produced.
+         table t0 is outside of the nested join, so WHERE condition
+         for t0 is attached directly to t0 (without triggers, and it
+         may be used to access t0). Applying WHERE(t0) to (t2,t0,t3)
+         record is invalid as we may miss combinations of (t1, t2, t3)
+         that satisfy condition cond1, and produce a null-complemented
+         (t1, t2.NULLs, t3.NULLs) row, which should not have been
+         produced.
 
          If table t0 is not between t2 and t3, the problem doesn't exist:
-          If t0 is located after (t2,t3), WHERE(t0) is applied after nested join
-           processing has finished.
-          If t0 is located before (t2,t3), predicates like WHERE_cond(t0, t2) are
-           wrapped into condition triggers, which takes care of correct nested
-           join processing.
+          If t0 is located after (t2,t3), WHERE(t0) is applied after nested
+           join processing has finished.
+          If t0 is located before (t2,t3), predicates like WHERE_cond(t0, t2)
+           are wrapped into condition triggers, which takes care of correct
+           nested join processing.
 
        HOW IT IS IMPLEMENTED
          The limitations on join order can be rephrased as follows: for valid
          join order one must be able to:
            1. write down the used tables in the join order on one line.
-           2. for each nested join, put one '(' and one ')' on the said line        
+           2. for each nested join, put one '(' and one ')' on the said line
            3. write "LEFT JOIN" and "ON (...)" where appropriate
            4. get a query equivalent to the query we're trying to execute.
 
          Calls to check_interleaving_with_nj() are equivalent to writing the
          above described line from left to right. 
-         A single check_interleaving_with_nj(A,B) call is equivalent to writing 
-         table B and appropriate brackets on condition that table A and
-         appropriate brackets is the last what was written. Graphically the
-         transition is as follows:
+
+         A single check_interleaving_with_nj(A,B) call is equivalent
+         to writing table B and appropriate brackets on condition that
+         table A and appropriate brackets is the last what was
+         written. Graphically the transition is as follows:
 
                               +---- current position
                               |
@@ -18164,8 +18161,7 @@ public:
 
   bool add_schema_fields(THD *thd, TABLE *table,
                          TMP_TABLE_PARAM *param,
-                         const ST_SCHEMA_TABLE &schema_table,
-                         const MY_BITMAP &bitmap);
+                         const ST_SCHEMA_TABLE &schema_table);
 
   bool finalize(THD *thd, TABLE *table, TMP_TABLE_PARAM *param,
                 bool do_not_open, bool keep_row_order);
@@ -18274,8 +18270,7 @@ TABLE *Create_tmp_table::start(THD *thd,
     No need to change table name to lower case as we are only creating
     MyISAM, Aria or HEAP tables here
   */
-  fn_format(path, path, mysql_tmpdir, "",
-            MY_REPLACE_EXT|MY_UNPACK_FILENAME);
+  fn_format(path, path, mysql_tmpdir, "", MY_REPLACE_EXT|MY_UNPACK_FILENAME);
 
   if (m_group)
   {
@@ -19097,8 +19092,7 @@ err:
 
 bool Create_tmp_table::add_schema_fields(THD *thd, TABLE *table,
                                          TMP_TABLE_PARAM *param,
-                                         const ST_SCHEMA_TABLE &schema_table,
-                                         const MY_BITMAP &bitmap)
+                                         const ST_SCHEMA_TABLE &schema_table)
 {
   DBUG_ENTER("Create_tmp_table::add_schema_fields");
   DBUG_ASSERT(table);
@@ -19117,11 +19111,9 @@ bool Create_tmp_table::add_schema_fields(THD *thd, TABLE *table,
   for (fieldnr= 0; !defs[fieldnr].end_marker(); fieldnr++)
   {
     const ST_FIELD_INFO &def= defs[fieldnr];
-    bool visible= bitmap_is_set(&bitmap, fieldnr);
     Record_addr addr(def.nullable());
     const Type_handler *h= def.type_handler();
-    Field *field= h->make_schema_field(&table->mem_root, table,
-                                       addr, def, visible);
+    Field *field= h->make_schema_field(&table->mem_root, table, addr, def);
     if (!field)
     {
       thd->mem_root= mem_root_save;
@@ -19184,17 +19176,16 @@ TABLE *create_tmp_table(THD *thd, TMP_TABLE_PARAM *param, List<Item> &fields,
 
 TABLE *create_tmp_table_for_schema(THD *thd, TMP_TABLE_PARAM *param,
                                    const ST_SCHEMA_TABLE &schema_table,
-                                   const MY_BITMAP &bitmap,
                                    longlong select_options,
                                    const LEX_CSTRING &table_alias,
-                                   bool keep_row_order)
+                                   bool do_not_open, bool keep_row_order)
 {
   TABLE *table;
   Create_tmp_table maker(param, (ORDER *) NULL, false, false,
                          select_options, HA_POS_ERROR);
   if (!(table= maker.start(thd, param, &table_alias)) ||
-      maker.add_schema_fields(thd, table, param, schema_table, bitmap) ||
-      maker.finalize(thd, table, param, false, keep_row_order))
+      maker.add_schema_fields(thd, table, param, schema_table) ||
+      maker.finalize(thd, table, param, do_not_open, keep_row_order))
   {
     maker.cleanup_on_failure(thd, table);
     return NULL;
@@ -19575,14 +19566,10 @@ bool create_internal_tmp_table(TABLE *table, KEY *keyinfo,
       }
     }
 
-    if (unlikely((error= maria_create(share->path.str,
-                                      file_type,
-                                      share->keys, &keydef,
-                                      (uint) (*recinfo-start_recinfo),
-                                      start_recinfo,
-                                      share->uniques, &uniquedef,
-                                      &create_info,
-                                      create_flags))))
+    if (unlikely((error= maria_create(share->path.str, file_type, share->keys,
+                                      &keydef, (uint) (*recinfo-start_recinfo),
+                                      start_recinfo, share->uniques, &uniquedef,
+                                      &create_info, create_flags))))
     {
       table->file->print_error(error,MYF(0));	/* purecov: inspected */
       table->db_stat=0;
@@ -21258,7 +21245,7 @@ int join_read_key2(THD *thd, JOIN_TAB *tab, TABLE *table, TABLE_REF *table_ref)
   if (tab && tab->bush_children)
   {
     TABLE_LIST *emb_sj_nest= tab->bush_children->start->emb_sj_nest;
-    emb_sj_nest->sj_subq_pred->left_expr->bring_value();
+    emb_sj_nest->sj_subq_pred->left_exp()->bring_value();
   }
 
   /* TODO: Why don't we do "Late NULLs Filtering" here? */
@@ -21890,8 +21877,8 @@ end_send(JOIN *join, JOIN_TAB *join_tab __attribute__((unused)),
 
 /*
   @brief
-    Perform a GROUP BY operation over a stream of rows ordered by their group. The 
-    result is sent into join->result.
+    Perform a GROUP BY operation over a stream of rows ordered by their group.
+    The result is sent into join->result.
 
   @detail
     Also applies HAVING, etc.
@@ -22171,7 +22158,9 @@ end:
 }
 
 
-/** Like end_update, but this is done with unique constraints instead of keys.  */
+/**
+   Like end_update, but this is done with unique constraints instead of keys.
+*/
 
 static enum_nested_loop_state
 end_unique_update(JOIN *join, JOIN_TAB *join_tab __attribute__((unused)),
@@ -23717,6 +23706,9 @@ check_reverse_order:
     else if (select && select->quick)
       select->quick->need_sorted_output();
 
+    tab->read_record.unlock_row= (tab->type == JT_EQ_REF) ?
+                                 join_read_key_unlock_row : rr_unlock_row;
+
   } // QEP has been modified
 
   /*
@@ -24240,8 +24232,7 @@ cmp_buffer_with_ref(THD *thd, TABLE *table, TABLE_REF *tab_ref)
 bool
 cp_buffer_from_ref(THD *thd, TABLE *table, TABLE_REF *ref)
 {
-  enum enum_check_fields save_count_cuted_fields= thd->count_cuted_fields;
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
   my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
   bool result= 0;
 
@@ -24253,7 +24244,6 @@ cp_buffer_from_ref(THD *thd, TABLE *table, TABLE_REF *ref)
       break;
     }
   }
-  thd->count_cuted_fields= save_count_cuted_fields;
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return result;
 }
@@ -24470,10 +24460,13 @@ int setup_order(THD *thd, Ref_ptr_array ref_pointer_array, TABLE_LIST *tables,
                 List<Item> &fields, List<Item> &all_fields, ORDER *order,
                 bool from_window_spec)
 { 
+  SELECT_LEX *select = thd->lex->current_select;
   enum_parsing_place context_analysis_place=
                      thd->lex->current_select->context_analysis_place;
   thd->where="order clause";
-  for (; order; order=order->next)
+  const bool for_union= select->master_unit()->is_unit_op() &&
+    select == select->master_unit()->fake_select_lex;
+  for (uint number = 1; order; order=order->next, number++)
   {
     if (find_order_in_list(thd, ref_pointer_array, tables, order, fields,
                            all_fields, false, true, from_window_spec))
@@ -24484,8 +24477,22 @@ int setup_order(THD *thd, Ref_ptr_array ref_pointer_array, TABLE_LIST *tables,
       my_error(ER_WINDOW_FUNCTION_IN_WINDOW_SPEC, MYF(0));
       return 1;
     }
-    if (from_window_spec && (*order->item)->with_sum_func() &&
-        (*order->item)->type() != Item::SUM_FUNC_ITEM)
+
+    if (!(*order->item)->with_sum_func())
+      continue;
+
+    /*
+      UNION queries cannot be used with an aggregate function in
+      an ORDER BY clause
+    */
+
+    if (for_union)
+    {
+      my_error(ER_AGGREGATE_ORDER_FOR_UNION, MYF(0), number);
+      return 1;
+    }
+
+    if (from_window_spec && (*order->item)->type() != Item::SUM_FUNC_ITEM)
       (*order->item)->split_sum_func(thd, ref_pointer_array,
                                      all_fields, SPLIT_SUM_SELECT);
   }
@@ -27961,10 +27968,10 @@ JOIN::reoptimize(Item *added_where, table_map join_tables,
   if (save_to)
   {
     DBUG_ASSERT(!keyuse.elements);
-    memcpy(keyuse.buffer,
-           save_to->keyuse.buffer,
-           (size_t) save_to->keyuse.elements * keyuse.size_of_element);
     keyuse.elements= save_to->keyuse.elements;
+    if (size_t e= keyuse.elements)
+      memcpy(keyuse.buffer,
+             save_to->keyuse.buffer, e * keyuse.size_of_element);
   }
 
   /* Add the new access methods to the keyuse array. */
@@ -28990,6 +28997,40 @@ void JOIN::handle_implicit_grouping_with_window_funcs()
   {
     const_tables= top_join_tab_count= table_count= 0;
   }
+}
+
+
+
+/*
+  @brief
+    Perform a partial cleanup for the JOIN_TAB structure
+
+  @note
+    this is used to cleanup resources for the re-execution of correlated
+    subqueries.
+*/
+void JOIN_TAB::partial_cleanup()
+{
+  if (!table)
+    return;
+
+  if (table->is_created())
+  {
+    table->file->ha_index_or_rnd_end();
+    DBUG_PRINT("info", ("close index: %s.%s  alias: %s",
+               table->s->db.str,
+               table->s->table_name.str,
+               table->alias.c_ptr()));
+    if (aggr)
+    {
+      int tmp= 0;
+      if ((tmp= table->file->extra(HA_EXTRA_NO_CACHE)))
+        table->file->print_error(tmp, MYF(0));
+    }
+  }
+  delete filesort_result;
+  filesort_result= NULL;
+  free_cache(&read_record);
 }
 
 

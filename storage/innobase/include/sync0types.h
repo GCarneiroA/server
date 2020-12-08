@@ -186,38 +186,17 @@ enum latch_level_t {
 	RW_LOCK_X,
 	RW_LOCK_NOT_LOCKED,
 
-	SYNC_MONITOR_MUTEX,
-
 	SYNC_ANY_LATCH,
-
-	SYNC_DOUBLEWRITE,
-
-	SYNC_BUF_FLUSH_LIST,
-
-	SYNC_BUF_PAGE_HASH,
-
-	SYNC_BUF_POOL,
 
 	SYNC_POOL,
 	SYNC_POOL_MANAGER,
-
-	SYNC_SEARCH_SYS,
 
 	SYNC_WORK_QUEUE,
 
 	SYNC_FTS_TOKENIZE,
 	SYNC_FTS_OPTIMIZE,
-	SYNC_FTS_BG_THREADS,
-	SYNC_FTS_CACHE_INIT,
 	SYNC_RECV,
-	SYNC_LOG_FLUSH_ORDER,
-	SYNC_LOG,
-	SYNC_LOG_WRITE,
-	SYNC_PAGE_CLEANER,
 	SYNC_PURGE_QUEUE,
-	SYNC_TRX_SYS_HEADER,
-	SYNC_REC_LOCK,
-	SYNC_THREADS,
 	SYNC_TRX,
 	SYNC_RW_TRX_HASH_ELEMENT,
 	SYNC_READ_VIEW,
@@ -227,49 +206,16 @@ enum latch_level_t {
 
 	SYNC_INDEX_ONLINE_LOG,
 
-	SYNC_IBUF_BITMAP,
 	SYNC_IBUF_BITMAP_MUTEX,
-	SYNC_IBUF_TREE_NODE,
-	SYNC_IBUF_TREE_NODE_NEW,
-	SYNC_IBUF_INDEX_TREE,
 
 	SYNC_IBUF_MUTEX,
 
-	SYNC_FSP_PAGE,
-	SYNC_FSP,
-	SYNC_EXTERN_STORAGE,
-	SYNC_TRX_UNDO_PAGE,
-	SYNC_RSEG_HEADER,
-	SYNC_RSEG_HEADER_NEW,
 	SYNC_NOREDO_RSEG,
 	SYNC_REDO_RSEG,
-	SYNC_PURGE_LATCH,
-	SYNC_TREE_NODE,
-	SYNC_TREE_NODE_FROM_HASH,
-	SYNC_TREE_NODE_NEW,
 	SYNC_IBUF_PESS_INSERT_MUTEX,
-	SYNC_INDEX_TREE,
 
-	SYNC_IBUF_HEADER,
-	SYNC_DICT_HEADER,
 	SYNC_STATS_AUTO_RECALC,
-	SYNC_DICT_AUTOINC_MUTEX,
 	SYNC_DICT,
-	SYNC_FTS_CACHE,
-
-	SYNC_DICT_OPERATION,
-
-	SYNC_TRX_I_S_LAST_READ,
-
-	SYNC_TRX_I_S_RWLOCK,
-
-	SYNC_RECV_WRITER,
-
-	/** Level is varying. Only used with buffer pool page locks, which
-	do not have a fixed level, but instead have their level set after
-	the page is locked; see e.g.  ibuf_bitmap_get_map_page(). */
-
-	SYNC_LEVEL_VARYING,
 
 	/** This can be used to suppress order checking. */
 	SYNC_NO_ORDER_CHECK,
@@ -279,95 +225,50 @@ enum latch_level_t {
 };
 
 /** Each latch has an ID. This id is used for creating the latch and to look
-up its meta-data. See sync0debug.c. */
+up its meta-data. See sync0debug.cc. */
 enum latch_id_t {
 	LATCH_ID_NONE = 0,
-	LATCH_ID_AUTOINC,
-	LATCH_ID_BUF_POOL,
-	LATCH_ID_CACHE_LAST_READ,
 	LATCH_ID_DICT_FOREIGN_ERR,
 	LATCH_ID_DICT_SYS,
-	LATCH_ID_FILE_FORMAT_MAX,
 	LATCH_ID_FIL_SYSTEM,
-	LATCH_ID_FLUSH_LIST,
-	LATCH_ID_FTS_BG_THREADS,
 	LATCH_ID_FTS_DELETE,
-	LATCH_ID_FTS_OPTIMIZE,
 	LATCH_ID_FTS_DOC_ID,
 	LATCH_ID_FTS_PLL_TOKENIZE,
 	LATCH_ID_IBUF_BITMAP,
 	LATCH_ID_IBUF,
 	LATCH_ID_IBUF_PESSIMISTIC_INSERT,
-	LATCH_ID_LOG_SYS,
-	LATCH_ID_LOG_WRITE,
-	LATCH_ID_LOG_FLUSH_ORDER,
-	LATCH_ID_LIST,
-	LATCH_ID_MUTEX_LIST,
-	LATCH_ID_PAGE_CLEANER,
 	LATCH_ID_PURGE_SYS_PQ,
 	LATCH_ID_RECALC_POOL,
 	LATCH_ID_RECV_SYS,
-	LATCH_ID_RECV_WRITER,
 	LATCH_ID_REDO_RSEG,
 	LATCH_ID_NOREDO_RSEG,
-	LATCH_ID_RW_LOCK_DEBUG,
 	LATCH_ID_RTR_ACTIVE_MUTEX,
 	LATCH_ID_RTR_MATCH_MUTEX,
 	LATCH_ID_RTR_PATH_MUTEX,
-	LATCH_ID_RW_LOCK_LIST,
-	LATCH_ID_RW_LOCK_MUTEX,
 	LATCH_ID_SRV_INNODB_MONITOR,
 	LATCH_ID_SRV_MISC_TMPFILE,
 	LATCH_ID_SRV_MONITOR_FILE,
-	LATCH_ID_BUF_DBLWR,
 	LATCH_ID_TRX_POOL,
 	LATCH_ID_TRX_POOL_MANAGER,
 	LATCH_ID_TRX,
 	LATCH_ID_LOCK_SYS,
 	LATCH_ID_LOCK_SYS_WAIT,
 	LATCH_ID_TRX_SYS,
-	LATCH_ID_SRV_SYS,
 	LATCH_ID_SRV_SYS_TASKS,
 	LATCH_ID_PAGE_ZIP_STAT_PER_INDEX,
-	LATCH_ID_EVENT_MANAGER,
-	LATCH_ID_EVENT_MUTEX,
 	LATCH_ID_SYNC_ARRAY_MUTEX,
-	LATCH_ID_ZIP_PAD_MUTEX,
-	LATCH_ID_OS_AIO_READ_MUTEX,
-	LATCH_ID_OS_AIO_WRITE_MUTEX,
-	LATCH_ID_OS_AIO_LOG_MUTEX,
-	LATCH_ID_OS_AIO_IBUF_MUTEX,
-	LATCH_ID_OS_AIO_SYNC_MUTEX,
 	LATCH_ID_ROW_DROP_LIST,
 	LATCH_ID_INDEX_ONLINE_LOG,
 	LATCH_ID_WORK_QUEUE,
-	LATCH_ID_BTR_SEARCH,
-	LATCH_ID_BUF_BLOCK_LOCK,
-	LATCH_ID_BUF_BLOCK_DEBUG,
-	LATCH_ID_DICT_OPERATION,
-	LATCH_ID_CHECKPOINT,
-	LATCH_ID_FIL_SPACE,
-	LATCH_ID_FTS_CACHE,
-	LATCH_ID_FTS_CACHE_INIT,
-	LATCH_ID_TRX_I_S_CACHE,
-	LATCH_ID_TRX_PURGE,
-	LATCH_ID_IBUF_INDEX_TREE,
-	LATCH_ID_INDEX_TREE,
 	LATCH_ID_DICT_TABLE_STATS,
-	LATCH_ID_HASH_TABLE_RW_LOCK,
-	LATCH_ID_BUF_CHUNK_MAP_LATCH,
-	LATCH_ID_SYNC_DEBUG_MUTEX,
-	LATCH_ID_SCRUB_STAT_MUTEX,
 	LATCH_ID_DEFRAGMENT_MUTEX,
 	LATCH_ID_BTR_DEFRAGMENT_MUTEX,
-	LATCH_ID_FIL_CRYPT_MUTEX,
 	LATCH_ID_FIL_CRYPT_STAT_MUTEX,
 	LATCH_ID_FIL_CRYPT_DATA_MUTEX,
 	LATCH_ID_FIL_CRYPT_THREADS_MUTEX,
 	LATCH_ID_RW_TRX_HASH_ELEMENT,
 	LATCH_ID_READ_VIEW,
-	LATCH_ID_TEST_MUTEX,
-	LATCH_ID_MAX = LATCH_ID_TEST_MUTEX
+	LATCH_ID_MAX = LATCH_ID_READ_VIEW
 };
 
 #ifndef UNIV_INNOCHECKSUM
@@ -647,10 +548,10 @@ public:
 	}
 
 	/** Iterate over the counters */
-	template <typename Callback>
-	void iterate(Callback& callback) const
-		UNIV_NOTHROW
+	template<typename C> void iterate(const C& callback) UNIV_NOTHROW
 	{
+		m_mutex.enter();
+
 		Counters::const_iterator	end = m_counters.end();
 
 		for (Counters::const_iterator it = m_counters.begin();
@@ -659,6 +560,8 @@ public:
 
 			callback(*it);
 		}
+
+		m_mutex.exit();
 	}
 
 	/** Disable the monitoring */
@@ -941,27 +844,6 @@ sync_latch_get_name(latch_level_t level);
 const char*
 sync_basename(const char* filename);
 
-/** Register a latch, called when it is created
-@param[in]	ptr		Latch instance that was created
-@param[in]	filename	Filename where it was created
-@param[in]	line		Line number in filename */
-void
-sync_file_created_register(
-	const void*	ptr,
-	const char*	filename,
-	uint16_t	line);
-
-/** Deregister a latch, called when it is destroyed
-@param[in]	ptr		Latch to be destroyed */
-void
-sync_file_created_deregister(const void* ptr);
-
-/** Get the string where the file was created. Its format is "name:line"
-@param[in]	ptr		Latch instance
-@return created information or "" if can't be found */
-std::string
-sync_file_created_get(const void* ptr);
-
 #ifdef UNIV_DEBUG
 
 /** All (ordered) latches, used in debugging, must derive from this class. */
@@ -971,9 +853,7 @@ struct latch_t {
 	@param[in]	id	The latch ID */
 	explicit latch_t(latch_id_t id = LATCH_ID_NONE)
 		UNIV_NOTHROW
-		:
-		m_id(id),
-		m_rw_lock() {}
+		: m_id(id) {}
 
 	/** Destructor */
 	virtual ~latch_t() UNIV_NOTHROW { }
@@ -982,13 +862,6 @@ struct latch_t {
 	latch_id_t get_id() const
 	{
 		return(m_id);
-	}
-
-	/** @return true if it is a rw-lock */
-	bool is_rw_lock() const
-		UNIV_NOTHROW
-	{
-		return(m_rw_lock);
 	}
 
 	/** Print the latch context
@@ -1015,10 +888,6 @@ struct latch_t {
 
 	/** Latch ID */
 	latch_id_t	m_id;
-
-	/** true if it is a rw-lock. In debug mode, rw_lock_t derives from
-	this class and sets this variable. */
-	bool		m_rw_lock;
 };
 
 /** Subclass this to iterate over a thread's acquired latch levels. */
@@ -1039,12 +908,7 @@ struct sync_checker : public sync_check_functor_t
 	{
 		if (some_allowed) {
 			switch (level) {
-			case SYNC_RECV_WRITER:
-				/* This only happens in
-				recv_apply_hashed_log_recs. */
 			case SYNC_DICT:
-			case SYNC_DICT_OPERATION:
-			case SYNC_FTS_CACHE:
 			case SYNC_NO_ORDER_CHECK:
 				return(false);
 			default:
@@ -1096,16 +960,6 @@ private:
 @return LATCH_ID_NONE. */
 latch_id_t
 sync_latch_get_id(const char* name);
-
-typedef ulint rw_lock_flags_t;
-
-/* Flags to specify lock types for rw_lock_own_flagged() */
-enum rw_lock_flag_t {
-	RW_LOCK_FLAG_S  = 1 << 0,
-	RW_LOCK_FLAG_X  = 1 << 1,
-	RW_LOCK_FLAG_SX = 1 << 2
-};
-
 #endif /* UNIV_DBEUG */
 
 #endif /* UNIV_INNOCHECKSUM */

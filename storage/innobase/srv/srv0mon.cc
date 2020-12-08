@@ -381,55 +381,15 @@ static monitor_info_t	innodb_counter_info[] =
 	 MONITOR_NONE,
 	 MONITOR_DEFAULT_START, MONITOR_FLUSH_N_TO_FLUSH_BY_AGE},
 
-	{"buffer_flush_adaptive_avg_time_slot", "buffer",
-	 "Avg time (ms) spent for adaptive flushing recently per slot.",
+	{"buffer_flush_adaptive_avg_time", "buffer",
+	 "Avg time (ms) spent for adaptive flushing recently.",
 	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_FLUSH_ADAPTIVE_AVG_TIME_SLOT},
-
-	{"buffer_LRU_batch_flush_avg_time_slot", "buffer",
-	 "Avg time (ms) spent for LRU batch flushing recently per slot.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_LRU_BATCH_FLUSH_AVG_TIME_SLOT},
-
-	{"buffer_flush_adaptive_avg_time_thread", "buffer",
-	 "Avg time (ms) spent for adaptive flushing recently per thread.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_FLUSH_ADAPTIVE_AVG_TIME_THREAD},
-
-	{"buffer_LRU_batch_flush_avg_time_thread", "buffer",
-	 "Avg time (ms) spent for LRU batch flushing recently per thread.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_LRU_BATCH_FLUSH_AVG_TIME_THREAD},
-
-	{"buffer_flush_adaptive_avg_time_est", "buffer",
-	 "Estimated time (ms) spent for adaptive flushing recently.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_FLUSH_ADAPTIVE_AVG_TIME_EST},
-
-	{"buffer_LRU_batch_flush_avg_time_est", "buffer",
-	 "Estimated time (ms) spent for LRU batch flushing recently.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_LRU_BATCH_FLUSH_AVG_TIME_EST},
-
-	{"buffer_flush_avg_time", "buffer",
-	 "Avg time (ms) spent for flushing recently.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_FLUSH_AVG_TIME},
+	 MONITOR_DEFAULT_START, MONITOR_FLUSH_ADAPTIVE_AVG_TIME},
 
 	{"buffer_flush_adaptive_avg_pass", "buffer",
 	 "Number of adaptive flushes passed during the recent Avg period.",
 	 MONITOR_NONE,
 	 MONITOR_DEFAULT_START, MONITOR_FLUSH_ADAPTIVE_AVG_PASS},
-
-	{"buffer_LRU_batch_flush_avg_pass", "buffer",
-	 "Number of LRU batch flushes passed during the recent Avg period.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_LRU_BATCH_FLUSH_AVG_PASS},
-
-	{"buffer_flush_avg_pass", "buffer",
-	 "Number of flushes passed during the recent Avg period.",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_FLUSH_AVG_PASS},
 
 	{"buffer_LRU_get_free_loops", "buffer",
 	 "Total loops in LRU get free.",
@@ -561,23 +521,6 @@ static monitor_info_t	innodb_counter_info[] =
 	 "Pages queued as an LRU batch",
 	 MONITOR_SET_MEMBER, MONITOR_LRU_BATCH_EVICT_TOTAL_PAGE,
 	 MONITOR_LRU_BATCH_EVICT_PAGES},
-
-	/* Cumulative counter for single page LRU scans */
-	{"buffer_LRU_single_flush_scanned", "buffer",
-	 "Total pages scanned as part of single page LRU flush",
-	 MONITOR_SET_OWNER,
-	 MONITOR_LRU_SINGLE_FLUSH_SCANNED_NUM_CALL,
-	 MONITOR_LRU_SINGLE_FLUSH_SCANNED},
-
-	{"buffer_LRU_single_flush_num_scan", "buffer",
-	 "Number of times single page LRU flush is called",
-	 MONITOR_SET_MEMBER, MONITOR_LRU_SINGLE_FLUSH_SCANNED,
-	 MONITOR_LRU_SINGLE_FLUSH_SCANNED_NUM_CALL},
-
-	{"buffer_LRU_single_flush_scanned_per_call", "buffer",
-	 "Page scanned per single LRU flush",
-	 MONITOR_SET_MEMBER, MONITOR_LRU_SINGLE_FLUSH_SCANNED,
-	 MONITOR_LRU_SINGLE_FLUSH_SCANNED_PER_CALL},
 
 	{"buffer_LRU_single_flush_failure_count", "Buffer",
 	 "Number of times attempt to flush a single page from LRU failed",
@@ -905,12 +848,6 @@ static monitor_info_t	innodb_counter_info[] =
 	 MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
 	 MONITOR_DEFAULT_START, MONITOR_OVLD_MAX_AGE_ASYNC},
 
-	{"log_max_modified_age_sync", "recovery",
-	 "Maximum LSN difference; when exceeded, start synchronous preflush",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_MAX_AGE_SYNC},
-
 	{"log_pending_log_flushes", "recovery", "Pending log flushes",
 	 static_cast<monitor_type_t>(
 	 MONITOR_EXISTING | MONITOR_DISPLAY_CURRENT),
@@ -1209,11 +1146,6 @@ static monitor_info_t	innodb_counter_info[] =
 	 MONITOR_NONE,
 	 MONITOR_DEFAULT_START, MONITOR_SRV_DICT_LRU_EVICT_COUNT_IDLE},
 
-	{"innodb_checkpoint_usec", "server",
-	 "Time (in microseconds) spent by master thread to do checkpoint",
-	 MONITOR_NONE,
-	 MONITOR_DEFAULT_START, MONITOR_SRV_CHECKPOINT_MICROSECOND},
-
 	{"innodb_dblwr_writes", "server",
 	 "Number of doublewrite operations that have been performed"
 	 " (innodb_dblwr_writes)",
@@ -1233,60 +1165,6 @@ static monitor_info_t	innodb_counter_info[] =
 	 static_cast<monitor_type_t>(
 	 MONITOR_EXISTING | MONITOR_DEFAULT_ON | MONITOR_DISPLAY_CURRENT),
 	 MONITOR_DEFAULT_START, MONITOR_OVLD_SRV_PAGE_SIZE},
-
-	{"innodb_rwlock_s_spin_waits", "server",
-	 "Number of rwlock spin waits due to shared latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_S_SPIN_WAITS},
-
-	{"innodb_rwlock_x_spin_waits", "server",
-	 "Number of rwlock spin waits due to exclusive latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_X_SPIN_WAITS},
-
-	{"innodb_rwlock_sx_spin_waits", "server",
-	 "Number of rwlock spin waits due to sx latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_SX_SPIN_WAITS},
-
-	{"innodb_rwlock_s_spin_rounds", "server",
-	 "Number of rwlock spin loop rounds due to shared latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_S_SPIN_ROUNDS},
-
-	{"innodb_rwlock_x_spin_rounds", "server",
-	 "Number of rwlock spin loop rounds due to exclusive latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_X_SPIN_ROUNDS},
-
-	{"innodb_rwlock_sx_spin_rounds", "server",
-	 "Number of rwlock spin loop rounds due to sx latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_SX_SPIN_ROUNDS},
-
-	{"innodb_rwlock_s_os_waits", "server",
-	 "Number of OS waits due to shared latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_S_OS_WAITS},
-
-	{"innodb_rwlock_x_os_waits", "server",
-	 "Number of OS waits due to exclusive latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_X_OS_WAITS},
-
-	{"innodb_rwlock_sx_os_waits", "server",
-	 "Number of OS waits due to sx latch request",
-	 static_cast<monitor_type_t>(
-	 MONITOR_EXISTING | MONITOR_DEFAULT_ON),
-	 MONITOR_DEFAULT_START, MONITOR_OVLD_RWLOCK_SX_OS_WAITS},
 
 	/* ========== Counters for DML operations ========== */
 	{"module_dml", "dml", "Statistics for DMLs",
@@ -1468,7 +1346,8 @@ srv_mon_set_module_control(
 	ibool	set_current_module = FALSE;
 
 	ut_a(module_id <= NUM_MONITOR);
-	ut_a(UT_ARR_SIZE(innodb_counter_info) == NUM_MONITOR);
+	compile_time_assert(array_elements(innodb_counter_info)
+			    == NUM_MONITOR);
 
 	/* The module_id must be an ID of MONITOR_MODULE type */
 	ut_a(innodb_counter_info[module_id].monitor_type & MONITOR_MODULE);
@@ -1800,42 +1679,6 @@ srv_mon_process_existing_counter(
 		value = srv_page_size;
 		break;
 
-	case MONITOR_OVLD_RWLOCK_S_SPIN_WAITS:
-		value = rw_lock_stats.rw_s_spin_wait_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_X_SPIN_WAITS:
-		value = rw_lock_stats.rw_x_spin_wait_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_SX_SPIN_WAITS:
-		value = rw_lock_stats.rw_sx_spin_wait_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_S_SPIN_ROUNDS:
-		value = rw_lock_stats.rw_s_spin_round_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_X_SPIN_ROUNDS:
-		value = rw_lock_stats.rw_x_spin_round_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_SX_SPIN_ROUNDS:
-		value = rw_lock_stats.rw_sx_spin_round_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_S_OS_WAITS:
-		value = rw_lock_stats.rw_s_os_wait_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_X_OS_WAITS:
-		value = rw_lock_stats.rw_x_os_wait_count;
-		break;
-
-	case MONITOR_OVLD_RWLOCK_SX_OS_WAITS:
-		value = rw_lock_stats.rw_sx_os_wait_count;
-		break;
-
 	case MONITOR_OVLD_BUFFER_POOL_SIZE:
 		value = srv_buf_pool_size;
 		break;
@@ -1972,27 +1815,29 @@ srv_mon_process_existing_counter(
 		break;
 
 	case MONITOR_PENDING_CHECKPOINT_WRITE:
-		mutex_enter(&log_sys.mutex);
+		mysql_mutex_lock(&log_sys.mutex);
 		value = static_cast<mon_type_t>(
 		    log_sys.n_pending_checkpoint_writes);
-		mutex_exit(&log_sys.mutex);
+		mysql_mutex_unlock(&log_sys.mutex);
 		break;
 
 	case MONITOR_LOG_IO:
-		mutex_enter(&log_sys.mutex);
+		mysql_mutex_lock(&log_sys.mutex);
 		value = static_cast<mon_type_t>(log_sys.n_log_ios);
-		mutex_exit(&log_sys.mutex);
+		mysql_mutex_unlock(&log_sys.mutex);
 		break;
 
 	case MONITOR_LSN_CHECKPOINT_AGE:
-		mutex_enter(&log_sys.mutex);
+		mysql_mutex_lock(&log_sys.mutex);
 		value = static_cast<mon_type_t>(log_sys.get_lsn()
 						- log_sys.last_checkpoint_lsn);
-		mutex_exit(&log_sys.mutex);
+		mysql_mutex_unlock(&log_sys.mutex);
 		break;
 
 	case MONITOR_OVLD_BUF_OLDEST_LSN:
-		value = (mon_type_t) buf_pool.get_oldest_modification();
+		mysql_mutex_lock(&buf_pool.flush_list_mutex);
+		value = (mon_type_t) buf_pool.get_oldest_modification(0);
+		mysql_mutex_unlock(&buf_pool.flush_list_mutex);
 		break;
 
 	case MONITOR_OVLD_LSN_CHECKPOINT:
@@ -2001,10 +1846,6 @@ srv_mon_process_existing_counter(
 
 	case MONITOR_OVLD_MAX_AGE_ASYNC:
 		value = log_sys.max_modified_age_async;
-		break;
-
-	case MONITOR_OVLD_MAX_AGE_SYNC:
-		value = log_sys.max_modified_age_sync;
 		break;
 
 #ifdef BTR_CUR_HASH_ADAPT

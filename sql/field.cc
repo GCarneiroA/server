@@ -42,7 +42,7 @@
 #define MAX_EXPONENT 1024
 
 /*****************************************************************************
-  Instansiate templates and static variables
+  Instantiate templates and static variables
 *****************************************************************************/
 
 static const char *zero_timestamp="0000-00-00 00:00:00.000000";
@@ -57,7 +57,7 @@ const char field_separator=',';
 #define BLOB_PACK_LENGTH_TO_MAX_LENGH(arg) \
                         ((ulong) ((1LL << MY_MIN(arg, 4) * 8) - 1))
 
-// Column marked for read or the field set to read out or record[0] or [1]
+// Column marked for read or the field set to read out of record[0]
 bool Field::marked_for_read() const
 {
   return !table ||
@@ -68,7 +68,7 @@ bool Field::marked_for_read() const
 }
 
 /*
-  The name of this function is a bit missleading as in 10.4 we don't
+  The name of this function is a bit misleading as in 10.4 we don't
   have to test anymore if the field is computed. Instead we mark
   changed fields with DBUG_FIX_WRITE_SET() in table.cc
 */
@@ -88,7 +88,7 @@ bool Field::marked_for_write_or_computed() const
 /*
   Rules for merging different types of fields in UNION
 
-  NOTE: to avoid 256*256 table, gap in table types numeration is skiped
+  NOTE: to avoid 256*256 table, gap in table types numeration is skipped
   following #defines describe that gap and how to canculate number of fields
   and index of field in this array.
 */
@@ -1078,17 +1078,16 @@ Field_longstr::make_packed_sort_key_part(uchar *buff,
     *buff++=1;
   }
   uchar *end= pack_sort_string(buff, sort_field);
-  return static_cast<int>(end-buff);
+  return (uint) (end-buff);
 }
 
 
 uchar*
 Field_longstr::pack_sort_string(uchar *to, const SORT_FIELD_ATTR *sort_field)
 {
-  String buf;
+  StringBuffer<LONGLONG_BUFFER_SIZE+1> buf;
   val_str(&buf, &buf);
-  return to + sort_field->pack_sort_string(to, buf.lex_cstring(),
-                                           field_charset());
+  return to + sort_field->pack_sort_string(to, &buf, field_charset());
 }
 
 
@@ -1553,7 +1552,7 @@ Item *Field_num::get_equal_zerofill_const_item(THD *thd, const Context &ctx,
 
 
 /**
-  Contruct warning parameters using thd->no_errors
+Construct warning parameters using thd->no_errors
   to determine whether to generate or suppress warnings.
   We can get here in a query like this:
     SELECT COUNT(@@basedir);
@@ -1601,7 +1600,7 @@ Value_source::Converter_string_to_number::check_edom_and_truncation(THD *thd,
     if (filter.want_warning_edom())
     {
       /*
-        We can use err.ptr() here as ErrConvString is guranteed to put an
+        We can use err.ptr() here as ErrConvString is guaranteed to put an
         end \0 here.
       */
       THD *wthd= thd ? thd : current_thd;
@@ -1633,7 +1632,7 @@ Value_source::Converter_string_to_number::check_edom_and_truncation(THD *thd,
   - found garbage at the end of the string.
 
   @param type          Data type name (e.g. "decimal", "integer", "double")
-  @param edom          Indicates that the string-to-number routine retuned
+  @param edom          Indicates that the string-to-number routine returned
                        an error code equivalent to EDOM (value out of domain),
                        i.e. the string fully consisted of garbage and the
                        conversion routine could not get any digits from it.
@@ -1696,7 +1695,7 @@ int Field_num::check_edom_and_truncation(const char *type, bool edom,
 
 
 /*
-  Conver a string to an integer then check bounds.
+  Convert a string to an integer then check bounds.
   
   SYNOPSIS
     Field_num::get_int
@@ -1889,12 +1888,24 @@ void Field::copy_from_tmp(int row_offset)
 }
 
 
-bool Field::send_binary(Protocol *protocol)
+bool Field::send(Protocol *protocol)
 {
   char buff[MAX_FIELD_WIDTH];
   String tmp(buff,sizeof(buff),charset());
   val_str(&tmp);
   return protocol->store(tmp.ptr(), tmp.length(), tmp.charset());
+}
+
+
+bool Field_num::send_numeric_zerofill_str(Protocol_text *protocol,
+                                          protocol_send_type_t send_type)
+{
+  DBUG_ASSERT(marked_for_read());
+  StringBuffer<MAX_FIELD_WIDTH> tmp(&my_charset_latin1);
+  val_str(&tmp);
+  return protocol->store_numeric_zerofill_str(tmp.ptr(),
+                                              tmp.length(),
+                                              send_type);
 }
 
 
@@ -2106,7 +2117,7 @@ void Field::make_send_field(Send_field *field)
     field->org_table_name= field->db_name= empty_clex_str;
   if (orig_table && orig_table->alias.ptr())
   {
-    field->table_name= orig_table->alias.lex_cstring();
+    orig_table->alias.get_value(&field->table_name);
     field->org_col_name= field_name;
   }
   else
@@ -2402,11 +2413,38 @@ uint Field::fill_cache_field(CACHE_FIELD *copy)
 bool Field::get_date(MYSQL_TIME *to, date_mode_t mode)
 {
   StringBuffer<40> tmp;
-  Temporal::Warn_push warn(get_thd(), NULL, NullS, to, mode);
+  Temporal::Warn_push warn(get_thd(), nullptr, nullptr, nullptr, to, mode);
   Temporal_hybrid *t= new(to) Temporal_hybrid(get_thd(), &warn,
                                               val_str(&tmp), mode);
   return !t->is_valid_temporal();
 }
+
+
+longlong Field::val_datetime_packed(THD *thd)
+{
+  MYSQL_TIME ltime, tmp;
+  if (get_date(&ltime, Datetime::Options_cmp(thd)))
+    return 0;
+  if (ltime.time_type != MYSQL_TIMESTAMP_TIME)
+    return pack_time(&ltime);
+  if (time_to_datetime_with_warn(thd, &ltime, &tmp, TIME_CONV_NONE))
+    return 0;
+  return pack_time(&tmp);
+}
+
+
+longlong Field::val_time_packed(THD *thd)
+{
+  MYSQL_TIME ltime;
+  Time::Options_cmp opt(thd);
+  if (get_date(&ltime, opt))
+    return 0;
+  if (ltime.time_type == MYSQL_TIMESTAMP_TIME)
+    return pack_time(&ltime);
+  // Conversion from DATETIME or DATE to TIME is needed
+  return Time(thd, &ltime, opt).to_packed();
+}
+
 
 /**
   This is called when storing a date in a string.
@@ -2810,7 +2848,7 @@ int Field_decimal::store(const char *from_arg, size_t len, CHARSET_INFO *cs)
     We only have to generate warnings if count_cuted_fields is set.
     This is to avoid extra checks of the number when they are not needed.
     Even if this flag is not set, it's OK to increment warnings, if
-    it makes the code easer to read.
+    it makes the code easier to read.
   */
 
   if (get_thd()->count_cuted_fields > CHECK_FIELD_EXPRESSION)
@@ -2893,7 +2931,7 @@ int Field_decimal::store(const char *from_arg, size_t len, CHARSET_INFO *cs)
   }
   
   /*
-    Now write the formated number
+    Now write the formatted number
     
     First the digits of the int_% parts.
     Do we have enough room to write these digits ?
@@ -3410,7 +3448,7 @@ int Field_new_decimal::store(const char *from, size_t length,
             If check_decimal() failed because of EDOM-alike error,
             (e.g. E_DEC_BAD_NUM), we have to initialize decimal_value to zero.
             Note: if check_decimal() failed because of truncation,
-            decimal_value is alreay properly initialized.
+            decimal_value is already properly initialized.
           */
           my_decimal_set_zero(&decimal_value);
           /*
@@ -3856,10 +3894,15 @@ String *Field_tiny::val_str(String *val_buffer,
   return val_str_from_long(val_buffer, 5, -10, nr);
 }
 
-bool Field_tiny::send_binary(Protocol *protocol)
+bool Field_tiny::send(Protocol *protocol)
 {
-  return protocol->store_tiny((longlong) (int8) ptr[0]);
+  DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_TINY);
+  return protocol->store_tiny(Field_tiny::val_int());
 }
+
 
 int Field_tiny::cmp(const uchar *a_ptr, const uchar *b_ptr) const
 {
@@ -4016,8 +4059,12 @@ String *Field_short::val_str(String *val_buffer,
 }
 
 
-bool Field_short::send_binary(Protocol *protocol)
+bool Field_short::send(Protocol *protocol)
 {
+  DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_SHORT);
   return protocol->store_short(Field_short::val_int());
 }
 
@@ -4199,9 +4246,12 @@ String *Field_int::val_str_from_long(String *val_buffer,
 }
 
 
-bool Field_medium::send_binary(Protocol *protocol)
+bool Field_medium::send(Protocol *protocol)
 {
   DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_LONG);
   return protocol->store_long(Field_medium::val_int());
 }
 
@@ -4370,11 +4420,15 @@ String *Field_long::val_str(String *val_buffer,
 }
 
 
-bool Field_long::send_binary(Protocol *protocol)
+bool Field_long::send(Protocol *protocol)
 {
   DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_LONG);
   return protocol->store_long(Field_long::val_int());
 }
+
 
 int Field_long::cmp(const uchar *a_ptr, const uchar *b_ptr) const
 {
@@ -4507,9 +4561,12 @@ String *Field_longlong::val_str(String *val_buffer,
 }
 
 
-bool Field_longlong::send_binary(Protocol *protocol)
+bool Field_longlong::send(Protocol *protocol)
 {
   DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_LONGLONG);
   return protocol->store_longlong(Field_longlong::val_int(), unsigned_flag);
 }
 
@@ -4687,10 +4744,13 @@ void Field_float::sort_string(uchar *to,uint length __attribute__((unused)))
 }
 
 
-bool Field_float::send_binary(Protocol *protocol)
+bool Field_float::send(Protocol *protocol)
 {
   DBUG_ASSERT(marked_for_read());
-  return protocol->store((float) Field_float::val_real(), dec, (String*) 0);
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_FLOAT);
+  return protocol->store_float((float) Field_float::val_real(), dec);
 }
 
 
@@ -4782,11 +4842,12 @@ int truncate_double(double *nr, uint field_length, uint dec,
   {
     uint order= field_length - dec;
     uint step= array_elements(log_10) - 1;
-    max_value= 1.0;
+    double max_value_by_dec= 1.0;
     for (; order > step; order-= step)
-      max_value*= log_10[step];
-    max_value*= log_10[order];
-    max_value-= 1.0 / log_10[dec];
+      max_value_by_dec*= log_10[step];
+    max_value_by_dec*= log_10[order];
+    max_value_by_dec-= 1.0 / log_10[dec];
+    set_if_smaller(max_value, max_value_by_dec);
 
     /* Check for infinity so we don't get NaN in calculations */
     if (!std::isinf(res))
@@ -4980,9 +5041,13 @@ String *Field_double::val_str(String *val_buffer,
   return val_buffer;
 }
 
-bool Field_double::send_binary(Protocol *protocol)
+bool Field_double::send(Protocol *protocol)
 {
-  return protocol->store((double) Field_double::val_real(), dec, (String*) 0);
+  DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if (unlikely(zerofill) && (txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_DOUBLE);
+  return protocol->store_double(Field_double::val_real(), dec);
 }
 
 
@@ -5077,7 +5142,7 @@ Field_timestamp::Field_timestamp(uchar *ptr_arg, uint32 len_arg,
   {
     /*
       We mark the flag with TIMESTAMP_FLAG to indicate to the client that
-      this field will be automaticly updated on insert.
+      this field will be automatically updated on insert.
     */
     flags|= TIMESTAMP_FLAG;
     if (unireg_check != TIMESTAMP_DN_FIELD)
@@ -5378,7 +5443,7 @@ bool Field_timestamp::get_date(MYSQL_TIME *ltime, date_mode_t fuzzydate)
 }
 
 
-bool Field_timestamp0::send_binary(Protocol *protocol)
+bool Field_timestamp0::send(Protocol *protocol)
 {
   MYSQL_TIME ltime;
   Field_timestamp0::get_date(&ltime, date_mode_t(0));
@@ -5538,7 +5603,7 @@ int Field_timestamp_with_dec::set_time()
   return 0;
 }
 
-bool Field_timestamp_with_dec::send_binary(Protocol *protocol)
+bool Field_timestamp_with_dec::send(Protocol *protocol)
 {
   MYSQL_TIME ltime;
   Field_timestamp::get_date(&ltime, date_mode_t(0));
@@ -5827,9 +5892,7 @@ Item *Field_temporal::get_equal_const_item_datetime(THD *thd,
         See comments about truncation in the same place in
         Field_time::get_equal_const_item().
       */
-      return new (thd->mem_root) Item_datetime_literal(thd,
-                                                       dt.get_mysql_time(),
-                                                       decimals());
+      return new (thd->mem_root) Item_datetime_literal(thd, &dt, decimals());
     }
     break;
   case ANY_SUBST:
@@ -5841,7 +5904,7 @@ Item *Field_temporal::get_equal_const_item_datetime(THD *thd,
       if (!dt.is_valid_datetime())
         return NULL;
       return new (thd->mem_root)
-        Item_datetime_literal_for_invalid_dates(thd, dt.get_mysql_time(),
+        Item_datetime_literal_for_invalid_dates(thd, &dt,
                                                 dt.get_mysql_time()->
                                                 second_part ?
                                                 TIME_SECOND_PART_DIGITS : 0);
@@ -6047,7 +6110,25 @@ bool Field_time0::get_date(MYSQL_TIME *ltime, date_mode_t fuzzydate)
 }
 
 
-bool Field_time::send_binary(Protocol *protocol)
+int Field_time::store_native(const Native &value)
+{
+  Time t(value);
+  DBUG_ASSERT(t.is_valid_time());
+  store_TIME(t);
+  return 0;
+}
+
+
+bool Field_time::val_native(Native *to)
+{
+  MYSQL_TIME ltime;
+  get_date(&ltime, date_mode_t(0));
+  int warn;
+  return Time(&warn, &ltime, 0).to_native(to, decimals());
+}
+
+
+bool Field_time::send(Protocol *protocol)
 {
   MYSQL_TIME ltime;
   get_date(&ltime, Time::Options(TIME_TIME_ONLY, get_thd()));
@@ -6163,7 +6244,7 @@ Item *Field_time::get_equal_const_item(THD *thd, const Context &ctx,
 
         (assuming CURRENT_DATE is '2015-08-30'
       */
-      return new (thd->mem_root) Item_time_literal(thd, tm.get_mysql_time(),
+      return new (thd->mem_root) Item_time_literal(thd, &tm,
                                                    tm.get_mysql_time()->
                                                    second_part ?
                                                    TIME_SECOND_PART_DIGITS :
@@ -6192,8 +6273,7 @@ Item *Field_time::get_equal_const_item(THD *thd, const Context &ctx,
               decimals());
       if (!tm.is_valid_time())
         return NULL;
-      return new (thd->mem_root) Item_time_literal(thd, tm.get_mysql_time(),
-                                                   decimals());
+      return new (thd->mem_root) Item_time_literal(thd, &tm, decimals());
     }
     break;
   }
@@ -6283,6 +6363,33 @@ Binlog_type_info Field_timef::binlog_type_info() const
   return Binlog_type_info(Field_timef::binlog_type(), decimals(), 1);
 }
 
+
+longlong Field_timef::val_time_packed(THD *thd)
+{
+  DBUG_ASSERT(marked_for_read());
+  longlong tmp= my_time_packed_from_binary(ptr, dec);
+  MYSQL_TIME ltime;
+  TIME_from_longlong_time_packed(&ltime, tmp);
+  return pack_time(&ltime);
+}
+
+
+int Field_timef::store_native(const Native &value)
+{
+  DBUG_ASSERT(value.length() == my_time_binary_length(dec));
+  DBUG_ASSERT(Time(value).is_valid_time());
+  memcpy(ptr, value.ptr(), value.length());
+  return 0;
+}
+
+
+bool Field_timef::val_native(Native *to)
+{
+  uint32 binlen= my_time_binary_length(dec);
+  return to->copy((const char*) ptr, binlen);
+}
+
+
 /****************************************************************************
 ** year type
 ** Save in a byte the year 0, 1901->2155
@@ -6369,9 +6476,12 @@ int Field_year::store_time_dec(const MYSQL_TIME *ltime, uint dec_arg)
   return 0;
 }
 
-bool Field_year::send_binary(Protocol *protocol)
+bool Field_year::send(Protocol *protocol)
 {
   DBUG_ASSERT(marked_for_read());
+  Protocol_text *txt;
+  if ((txt= dynamic_cast<Protocol_text*>(protocol)))
+    return send_numeric_zerofill_str(txt, PROTOCOL_SEND_SHORT);
   ulonglong tmp= Field_year::val_int();
   return protocol->store_short(tmp);
 }
@@ -6506,7 +6616,7 @@ void Field_date::store_TIME(const MYSQL_TIME *ltime)
   int4store(ptr,tmp);
 }
 
-bool Field_date::send_binary(Protocol *protocol)
+bool Field_date::send(Protocol *protocol)
 {
   longlong tmp= Field_date::val_int();
   MYSQL_TIME tm;
@@ -6600,7 +6710,7 @@ void Field_newdate::store_TIME(const MYSQL_TIME *ltime)
 }
 
 
-bool Field_newdate::send_binary(Protocol *protocol)
+bool Field_newdate::send(Protocol *protocol)
 {
   MYSQL_TIME tm;
   Field_newdate::get_date(&tm, date_mode_t(0));
@@ -6668,6 +6778,14 @@ bool Field_newdate::get_TIME(MYSQL_TIME *ltime, const uchar *pos,
 }
 
 
+longlong Field_newdate::val_datetime_packed(THD *thd)
+{
+  MYSQL_TIME ltime;
+  Field_newdate::get_date(&ltime, date_mode_t(0));
+  return pack_time(&ltime);
+}
+
+
 int Field_newdate::cmp(const uchar *a_ptr, const uchar *b_ptr) const
 {
   uint32 a,b;
@@ -6721,12 +6839,12 @@ Item *Field_newdate::get_equal_const_item(THD *thd, const Context &ctx,
       */
       if (!dt.hhmmssff_is_zero())
         return new (thd->mem_root)
-          Item_datetime_literal_for_invalid_dates(thd, dt.get_mysql_time(),
+          Item_datetime_literal_for_invalid_dates(thd, &dt,
                                                   dt.get_mysql_time()->
                                                     second_part ?
                                                   TIME_SECOND_PART_DIGITS : 0);
-      return new (thd->mem_root)
-        Item_date_literal_for_invalid_dates(thd, Date(&dt).get_mysql_time());
+      Date d(&dt);
+      return new (thd->mem_root) Item_date_literal_for_invalid_dates(thd, &d);
     }
     break;
   case IDENTITY_SUBST:
@@ -6741,8 +6859,8 @@ Item *Field_newdate::get_equal_const_item(THD *thd, const Context &ctx,
       Datetime dt(thd, const_item, Datetime::Options(TIME_CONV_NONE, thd));
       if (!dt.is_valid_datetime())
         return NULL;
-      return new (thd->mem_root)
-        Item_date_literal(thd, Date(&dt).get_mysql_time());
+      Date d(&dt);
+      return new (thd->mem_root) Item_date_literal(thd, &d);
     }
     break;
   }
@@ -6772,7 +6890,7 @@ Field_datetime::conversion_depends_on_sql_mode(THD *thd, Item *expr) const
 }
 
 
-bool Field_datetime0::send_binary(Protocol *protocol)
+bool Field_datetime0::send(Protocol *protocol)
 {
   MYSQL_TIME tm;
   Field_datetime0::get_date(&tm, date_mode_t(0));
@@ -6900,7 +7018,7 @@ void Field_datetime_hires::store_TIME(const MYSQL_TIME *ltime)
   store_bigendian(packed, ptr, Field_datetime_hires::pack_length());
 }
 
-bool Field_datetime_with_dec::send_binary(Protocol *protocol)
+bool Field_datetime_with_dec::send(Protocol *protocol)
 {
   MYSQL_TIME ltime;
   get_date(&ltime, date_mode_t(0));
@@ -6988,6 +7106,16 @@ Binlog_type_info Field_datetimef::binlog_type_info() const
 {
   return Binlog_type_info(Field_datetimef::binlog_type(), decimals(), 1);
 }
+
+longlong Field_datetimef::val_datetime_packed(THD *thd)
+{
+  DBUG_ASSERT(marked_for_read());
+  longlong tmp= my_datetime_packed_from_binary(ptr, dec);
+  MYSQL_TIME ltime;
+  TIME_from_longlong_datetime_packed(&ltime, tmp);
+  return pack_time(&ltime);
+}
+
 
 /****************************************************************************
 ** string type
@@ -7108,6 +7236,23 @@ void Field_longstr::make_send_field(Send_field *field)
     check_constraint->expr->set_format_by_check_constraint(field);
   }
 }
+
+
+/*
+  An optimized version that uses less stack than Field::send().
+*/
+bool Field_longstr::send(Protocol *protocol)
+{
+  String tmp;
+  val_str(&tmp, &tmp);
+  /*
+    Ensure this function is only used with classes that do not allocate
+    memory in val_str()
+  */
+  DBUG_ASSERT(tmp.alloced_length() == 0);
+  return protocol->store(tmp.ptr(), tmp.length(), tmp.charset());
+}
+
 
 	/* Copy a string and fill with space */
 
@@ -7506,7 +7651,7 @@ Field_string::unpack(uchar *to, const uchar *from, const uchar *from_end,
    with the real type.  Since all allowable types have 0xF as most
    significant bits of the metadata word, lengths <256 will not affect
    the real type at all, while all other values will result in a
-   non-existant type in the range 17-244.
+   non-existent type in the range 17-244.
 
    @see Field_string::unpack
 
@@ -7698,6 +7843,17 @@ my_decimal *Field_varstring::val_decimal(my_decimal *decimal_value)
 }
 
 
+/*
+  An optimized version that uses less stack and less temporary
+  variable initialization than Field_longstr::send()
+*/
+bool Field_varstring::send(Protocol *protocol)
+{
+  return protocol->store((const char *) get_data(), get_length(),
+                         field_charset());
+}
+
+
 #ifdef HAVE_valgrind
 void Field_varstring::mark_unused_memory_as_defined()
 {
@@ -7707,8 +7863,7 @@ void Field_varstring::mark_unused_memory_as_defined()
 #endif
 
 
-int Field_varstring::cmp_max(const uchar *a_ptr, const uchar *b_ptr,
-                             uint max_len) const
+int Field_varstring::cmp(const uchar *a_ptr, const uchar *b_ptr) const
 {
   uint a_length, b_length;
   int diff;
@@ -7723,11 +7878,48 @@ int Field_varstring::cmp_max(const uchar *a_ptr, const uchar *b_ptr,
     a_length= uint2korr(a_ptr);
     b_length= uint2korr(b_ptr);
   }
-  set_if_smaller(a_length, max_len);
-  set_if_smaller(b_length, max_len);
+  set_if_smaller(a_length, field_length);
+  set_if_smaller(b_length, field_length);
   diff= field_charset()->strnncollsp(a_ptr + length_bytes, a_length,
                                      b_ptr + length_bytes, b_length);
   return diff;
+}
+
+
+static int cmp_str_prefix(const uchar *ua, size_t alen, const uchar *ub,
+                          size_t blen, size_t prefix, CHARSET_INFO *cs)
+{
+  const char *a= (char*)ua, *b= (char*)ub;
+  MY_STRCOPY_STATUS status;
+  prefix/= cs->mbmaxlen;
+  alen= cs->cset->well_formed_char_length(cs, a, a + alen, prefix, &status);
+  blen= cs->cset->well_formed_char_length(cs, b, b + blen, prefix, &status);
+  return cs->coll->strnncollsp(cs, ua, alen, ub, blen);
+}
+
+
+
+int Field_varstring::cmp_prefix(const uchar *a_ptr, const uchar *b_ptr,
+                                size_t prefix_len) const
+{
+  /* avoid expensive well_formed_char_length if possible */
+  if (prefix_len == table->field[field_index]->field_length)
+    return Field_varstring::cmp(a_ptr, b_ptr);
+
+  size_t a_length, b_length;
+
+  if (length_bytes == 1)
+  {
+    a_length= *a_ptr;
+    b_length= *b_ptr;
+  }
+  else
+  {
+    a_length= uint2korr(a_ptr);
+    b_length= uint2korr(b_ptr);
+  }
+  return cmp_str_prefix(a_ptr+length_bytes, a_length, b_ptr+length_bytes,
+                        b_length, prefix_len, field_charset());
 }
 
 
@@ -8236,8 +8428,8 @@ longlong Field_varstring_compressed::val_int(void)
 }
 
 
-int Field_varstring_compressed::cmp_max(const uchar *a_ptr, const uchar *b_ptr,
-                                        uint max_len) const
+int Field_varstring_compressed::cmp(const uchar *a_ptr,
+                                    const uchar *b_ptr) const
 {
   String a, b;
   uint a_length, b_length;
@@ -8256,13 +8448,10 @@ int Field_varstring_compressed::cmp_max(const uchar *a_ptr, const uchar *b_ptr,
   uncompress(&a, &a, a_ptr + length_bytes, a_length);
   uncompress(&b, &b, b_ptr + length_bytes, b_length);
 
-  if (a.length() > max_len)
-    a.length(max_len);
-  if (b.length() > max_len)
-    b.length(max_len);
-
   return sortcmp(&a, &b, field_charset());
 }
+
+
 Binlog_type_info Field_varstring_compressed::binlog_type_info() const
 {
   return Binlog_type_info(Field_varstring_compressed::binlog_type(),
@@ -8499,16 +8688,25 @@ int Field_blob::cmp(const uchar *a,uint32 a_length, const uchar *b,
 }
 
 
-int Field_blob::cmp_max(const uchar *a_ptr, const uchar *b_ptr,
-                        uint max_length) const
+int Field_blob::cmp(const uchar *a_ptr, const uchar *b_ptr) const
 {
   uchar *blob1,*blob2;
   memcpy(&blob1, a_ptr+packlength, sizeof(char*));
   memcpy(&blob2, b_ptr+packlength, sizeof(char*));
-  uint a_len= get_length(a_ptr), b_len= get_length(b_ptr);
-  set_if_smaller(a_len, max_length);
-  set_if_smaller(b_len, max_length);
-  return Field_blob::cmp(blob1,a_len,blob2,b_len);
+  size_t a_len= get_length(a_ptr), b_len= get_length(b_ptr);
+  return cmp(blob1, (uint32)a_len, blob2, (uint32)b_len);
+}
+
+
+int Field_blob::cmp_prefix(const uchar *a_ptr, const uchar *b_ptr,
+                           size_t prefix_len) const
+{
+  uchar *blob1,*blob2;
+  memcpy(&blob1, a_ptr+packlength, sizeof(char*));
+  memcpy(&blob2, b_ptr+packlength, sizeof(char*));
+  size_t a_len= get_length(a_ptr), b_len= get_length(b_ptr);
+  return cmp_str_prefix(blob1, a_len, blob2, b_len, prefix_len,
+                        field_charset());
 }
 
 
@@ -8526,7 +8724,10 @@ int Field_blob::cmp_binary(const uchar *a_ptr, const uchar *b_ptr,
   b_length=get_length(b_ptr);
   if (b_length > max_length)
     b_length=max_length;
-  diff=memcmp(a,b,MY_MIN(a_length,b_length));
+  if (uint32 len= MY_MIN(a_length,b_length))
+    diff= memcmp(a,b,len);
+  else
+    diff= 0;
   return diff ? diff : (int) (a_length - b_length);
 }
 
@@ -8553,7 +8754,8 @@ uint Field_blob::get_key_image_itRAW(const uchar *ptr_arg, uchar *buff,
     length=(uint) blob_length;
   }
   int2store(buff,length);
-  memcpy(buff+HA_KEY_BLOB_LENGTH, blob, length);
+  if (length)
+    memcpy(buff+HA_KEY_BLOB_LENGTH, blob, length);
   return HA_KEY_BLOB_LENGTH+length;
 }
 
@@ -9691,7 +9893,8 @@ my_decimal *Field_bit::val_decimal(my_decimal *deciaml_value)
     The a and b pointer must be pointers to the field in a record
     (not the table->record[0] necessarily)
 */
-int Field_bit::cmp_max(const uchar *a, const uchar *b, uint max_len) const
+int Field_bit::cmp_prefix(const uchar *a, const uchar *b,
+                          size_t prefix_len) const
 {
   my_ptrdiff_t a_diff= a - ptr;
   my_ptrdiff_t b_diff= b - ptr;
@@ -10888,14 +11091,16 @@ void Field::set_datetime_warning(Sql_condition::enum_warning_level level,
   if (thd->really_abort_on_warning() && level >= Sql_condition::WARN_LEVEL_WARN)
   {
     /*
-      field_str.name can be NULL when field is not in the select list:
+      field_name.str can be NULL when field is not in the select list:
         SET SESSION SQL_MODE= 'STRICT_ALL_TABLES,NO_ZERO_DATE';
         CREATE OR REPLACE TABLE t2 SELECT 1 AS f FROM t1 GROUP BY FROM_DAYS(d);
       Can't call push_warning_truncated_value_for_field() directly here,
       as it expect a non-NULL name.
     */
     thd->push_warning_wrong_or_truncated_value(level, false, typestr,
-                                               str->ptr(), table->s,
+                                               str->ptr(),
+                                               table->s->db.str,
+                                               table->s->table_name.str,
                                                field_name.str);
   }
   else

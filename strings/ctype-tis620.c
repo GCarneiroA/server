@@ -40,6 +40,8 @@
 
 #ifdef HAVE_CHARSET_tis620
 
+const char charset_name_tis620[]= "tis620";
+
 #define M  L_MIDDLE
 #define U  L_UPPER
 #define L  L_LOWER
@@ -553,9 +555,11 @@ int my_strnncollsp_tis620(CHARSET_INFO * cs __attribute__((unused)),
     alloced= a= (uchar*) my_malloc(PSI_INSTRUMENT_ME, a_length+b_length+2, MYF(MY_FAE));
   
   b= a + a_length+1;
-  memcpy((char*) a, (char*) a0, a_length);
+  if (a_length)
+    memcpy((char*) a, (char*) a0, a_length);
   a[a_length]= 0;	/* if length(a0)> len1, need to put 'end of string' */
-  memcpy((char *)b, (char *)b0, b_length);
+  if (b_length)
+    memcpy((char *)b, (char *)b0, b_length);
   b[b_length]= 0;	/* put end of string */
   a_length= thai2sortable(a, a_length);
   b_length= thai2sortable(b, b_length);
@@ -914,7 +918,7 @@ struct charset_info_st my_charset_tis620_thai_ci=
 {
     18,0,0,		/* number    */
     MY_CS_COMPILED|MY_CS_PRIMARY|MY_CS_STRNXFRM|MY_CS_NON1TO1, /* state     */
-    "tis620",		/* cs name    */
+    charset_name_tis620,		/* cs name    */
     "tis620_thai_ci",	/* name      */
     "",			/* comment   */
     NULL,		/* tailoring */
@@ -946,7 +950,7 @@ struct charset_info_st my_charset_tis620_bin=
 {
     89,0,0,		/* number    */
     MY_CS_COMPILED|MY_CS_BINSORT,	/* state     */
-    "tis620",		/* cs name    */
+    charset_name_tis620,		/* cs name    */
     "tis620_bin",	/* name      */
     "",			/* comment   */
     NULL,		/* tailoring */
@@ -979,7 +983,7 @@ struct charset_info_st my_charset_tis620_thai_nopad_ci=
 {
     MY_NOPAD_ID(18),0,0,   /* number           */
     MY_CS_COMPILED|MY_CS_STRNXFRM|MY_CS_NON1TO1|MY_CS_NOPAD, /* state */
-    "tis620",              /* cs name          */
+    charset_name_tis620,              /* cs name          */
     "tis620_thai_nopad_ci",/* name             */
     "",                    /* comment          */
     NULL,                  /* tailoring        */
@@ -1012,7 +1016,7 @@ struct charset_info_st my_charset_tis620_nopad_bin=
 {
     MY_NOPAD_ID(89),0,0,   /* number           */
     MY_CS_COMPILED|MY_CS_BINSORT|MY_CS_NOPAD, /* state */
-    "tis620",              /* cs name          */
+    charset_name_tis620,              /* cs name          */
     "tis620_nopad_bin",    /* name             */
     "",                    /* comment          */
     NULL,                  /* tailoring        */

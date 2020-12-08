@@ -65,9 +65,8 @@
 #define SIGNAL_FMT "signal %d"
 #endif
 
-#include <my_context.h>
 static my_bool non_blocking_api_enabled= 0;
-#if !defined(EMBEDDED_LIBRARY) && !defined(MY_CONTEXT_DISABLE)
+#if !defined(EMBEDDED_LIBRARY)
 #define WRAP_NONBLOCK_ENABLED non_blocking_api_enabled
 #include "../tests/nonblock-wrappers.h"
 #endif
@@ -185,7 +184,7 @@ static uint opt_tail_lines= 0;
 
 static uint opt_connect_timeout= 0;
 static uint opt_wait_for_pos_timeout= 0;
-
+static const  uint default_wait_for_pos_timeout= 300;
 static char delimiter[MAX_DELIMITER_LENGTH]= ";";
 static size_t delimiter_length= 1;
 
@@ -5080,6 +5079,8 @@ void do_shutdown_server(struct st_command *command)
   };
   DBUG_ENTER("do_shutdown_server");
 
+  /* the wait-for-pos' default based value of 'timeout' must fit to MDEV-23511 */
+  compile_time_assert(default_wait_for_pos_timeout / 5 >= 60);
   check_command_args(command, command->first_argument, shutdown_args,
                      sizeof(shutdown_args)/sizeof(struct command_arg),
                      ' ');
@@ -6002,10 +6003,8 @@ void do_connect(struct st_command *command)
   if (opt_connect_timeout)
     mysql_options(con_slot->mysql, MYSQL_OPT_CONNECT_TIMEOUT,
                   (void *) &opt_connect_timeout);
-#ifndef MY_CONTEXT_DISABLE
   if (mysql_options(con_slot->mysql, MYSQL_OPT_NONBLOCK, 0))
     die("Failed to initialise non-blocking API");
-#endif
   if (opt_compress || con_compress)
     mysql_options(con_slot->mysql, MYSQL_OPT_COMPRESS, NullS);
   mysql_options(con_slot->mysql, MYSQL_SET_CHARSET_NAME,
@@ -7061,7 +7060,7 @@ static struct my_option my_long_options[] =
   {"wait_for_pos_timeout", 0,
    "Number of seconds to wait for master_pos_wait",
    &opt_wait_for_pos_timeout, &opt_wait_for_pos_timeout, 0, GET_UINT,
-   REQUIRED_ARG, 300, 0, 3600 * 12, 0, 0, 0},
+   REQUIRED_ARG, default_wait_for_pos_timeout, 0, 3600 * 12, 0, 0, 0},
   {"plugin_dir", 0, "Directory for client-side plugins.",
     &opt_plugin_dir, &opt_plugin_dir, 0,
    GET_STR, REQUIRED_ARG, 0, 0, 0, 0, 0, 0},
@@ -9087,10 +9086,6 @@ static void init_signal_handling(void)
 {
   struct sigaction sa;
   DBUG_ENTER("init_signal_handling");
-
-#ifdef HAVE_STACKTRACE
-  my_init_stacktrace(0);
-#endif
 
   sa.sa_flags = SA_RESETHAND | SA_NODEFER;
   sigemptyset(&sa.sa_mask);

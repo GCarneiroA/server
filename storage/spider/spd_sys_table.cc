@@ -64,9 +64,11 @@ extern Time_zone *spd_tz_system;
 #define SPIDER_XA_MEMBER_DEFAULT_FILE_POS                    16
 #define SPIDER_XA_MEMBER_DEFAULT_GROUP_POS                   17
 #define SPIDER_XA_MEMBER_DSN_POS                             18
-#define SPIDER_XA_FAILED_LOG_THREAD_ID_POS                   19
-#define SPIDER_XA_FAILED_LOG_STATUS_POS                      20
-#define SPIDER_XA_FAILED_LOG_FAILED_TIME_POS                 21
+#define SPIDER_XA_MEMBER_FILEDSN_POS                         19
+#define SPIDER_XA_MEMBER_DRIVER_POS                          20
+#define SPIDER_XA_FAILED_LOG_THREAD_ID_POS                   21
+#define SPIDER_XA_FAILED_LOG_STATUS_POS                      22
+#define SPIDER_XA_FAILED_LOG_FAILED_TIME_POS                 23
 
 #define SPIDER_TABLES_DB_NAME_POS                             0
 #define SPIDER_TABLES_TABLE_NAME_POS                          1
@@ -89,11 +91,13 @@ extern Time_zone *spd_tz_system;
 #define SPIDER_TABLES_DEFAULT_FILE_POS                       18
 #define SPIDER_TABLES_DEFAULT_GROUP_POS                      19
 #define SPIDER_TABLES_DSN_POS                                20
-#define SPIDER_TABLES_TGT_DB_NAME_POS                        21
-#define SPIDER_TABLES_TGT_TABLE_NAME_POS                     22
-#define SPIDER_TABLES_LINK_STATUS_POS                        23
-#define SPIDER_TABLES_BLOCK_STATUS_POS                       24
-#define SPIDER_TABLES_STATIC_LINK_ID_POS                     25
+#define SPIDER_TABLES_FILEDSN_POS                            21
+#define SPIDER_TABLES_DRIVER_POS                             22
+#define SPIDER_TABLES_TGT_DB_NAME_POS                        23
+#define SPIDER_TABLES_TGT_TABLE_NAME_POS                     24
+#define SPIDER_TABLES_LINK_STATUS_POS                        25
+#define SPIDER_TABLES_BLOCK_STATUS_POS                       26
+#define SPIDER_TABLES_STATIC_LINK_ID_POS                     27
 
 #define SPIDER_LINK_MON_SERVERS_DB_NAME_POS                   0
 #define SPIDER_LINK_MON_SERVERS_TABLE_NAME_POS                1
@@ -115,6 +119,8 @@ extern Time_zone *spd_tz_system;
 #define SPIDER_LINK_MON_SERVERS_DEFAULT_FILE_POS             17
 #define SPIDER_LINK_MON_SERVERS_DEFAULT_GROUP_POS            18
 #define SPIDER_LINK_MON_SERVERS_DSN_POS                      19
+#define SPIDER_LINK_MON_SERVERS_FILEDSN_POS                  20
+#define SPIDER_LINK_MON_SERVERS_DRIVER_POS                   21
 
 #define SPIDER_LINK_FAILED_LOG_DB_NAME_POS                    0
 #define SPIDER_LINK_FAILED_LOG_TABLE_NAME_POS                 1
@@ -228,28 +234,15 @@ inline int spider_delete_sys_table_row(TABLE *table, int record_number = 0,
   return error_num;
 }
 
-#if MYSQL_VERSION_ID < 50500
 TABLE *spider_open_sys_table(
   THD *thd,
   const char *table_name,
   int table_name_length,
   bool write,
-  Open_tables_state *open_tables_backup,
+  SPIDER_Open_tables_backup *open_tables_backup,
   bool need_lock,
   int *error_num
-)
-#else
-TABLE *spider_open_sys_table(
-  THD *thd,
-  const char *table_name,
-  int table_name_length,
-  bool write,
-  Open_tables_backup *open_tables_backup,
-  bool need_lock,
-  int *error_num
-)
-#endif
-{
+) {
   TABLE *table;
   TABLE_LIST tables;
 #if MYSQL_VERSION_ID < 50500
@@ -306,7 +299,7 @@ TABLE *spider_open_sys_table(
     }
 #if MYSQL_VERSION_ID < 50500
   } else {
-    thd->reset_n_backup_open_tables_state(open_tables_backup);
+    SPIDER_reset_n_backup_open_tables_state(thd, open_tables_backup, NULL);
 
     if (!(table = (TABLE*) spider_malloc(spider_current_trx, 12,
       sizeof(*table), MYF(MY_WME))))
@@ -601,28 +594,18 @@ TABLE *spider_open_sys_table(
 error:
   spider_free(spider_current_trx, table, MYF(0));
 error_malloc:
-  thd->restore_backup_open_tables_state(open_tables_backup);
+  SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
 #endif
 error_col_num_chk:
   DBUG_RETURN(NULL);
 }
 
-#if MYSQL_VERSION_ID < 50500
 void spider_close_sys_table(
   THD *thd,
   TABLE *table,
-  Open_tables_state *open_tables_backup,
+  SPIDER_Open_tables_backup *open_tables_backup,
   bool need_lock
-)
-#else
-void spider_close_sys_table(
-  THD *thd,
-  TABLE *table,
-  Open_tables_backup *open_tables_backup,
-  bool need_lock
-)
-#endif
-{
+) {
   DBUG_ENTER("spider_close_sys_table");
 #if MYSQL_VERSION_ID < 50500
   if (need_lock)
@@ -632,7 +615,7 @@ void spider_close_sys_table(
     table->file->ha_reset();
     closefrm(table, TRUE);
     spider_free(spider_current_trx, table, MYF(0));
-    thd->restore_backup_open_tables_state(open_tables_backup);
+    SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
   }
 #else
   spider_sys_close_table(thd, open_tables_backup);
@@ -642,20 +625,28 @@ void spider_close_sys_table(
 
 #if MYSQL_VERSION_ID < 50500
 #else
-bool spider_sys_open_tables(
+bool spider_sys_open_and_lock_tables(
   THD *thd,
   TABLE_LIST **tables,
-  Open_tables_backup *open_tables_backup
+  SPIDER_Open_tables_backup *open_tables_backup
 ) {
   uint counter;
+  uint flags = MYSQL_OPEN_IGNORE_GLOBAL_READ_LOCK |
+    MYSQL_LOCK_IGNORE_GLOBAL_READ_ONLY | MYSQL_OPEN_IGNORE_FLUSH |
+    MYSQL_LOCK_IGNORE_TIMEOUT | MYSQL_LOCK_LOG_TABLE;
   ulonglong utime_after_lock_backup = thd->utime_after_lock;
-  DBUG_ENTER("spider_sys_open_tables");
-  thd->reset_n_backup_open_tables_state(open_tables_backup);
-  if (open_tables(thd, tables, &counter,
-    MYSQL_OPEN_IGNORE_GLOBAL_READ_LOCK | MYSQL_LOCK_IGNORE_GLOBAL_READ_ONLY |
-    MYSQL_OPEN_IGNORE_FLUSH | MYSQL_LOCK_IGNORE_TIMEOUT | MYSQL_LOCK_LOG_TABLE
-  )) {
-    thd->restore_backup_open_tables_state(open_tables_backup);
+  DBUG_ENTER("spider_sys_open_and_lock_tables");
+  SPIDER_reset_n_backup_open_tables_state(thd, open_tables_backup, TRUE);
+  if (open_tables(thd, tables, &counter, flags))
+  {
+    SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
+    thd->utime_after_lock = utime_after_lock_backup;
+    DBUG_RETURN(TRUE);
+  }
+  if (lock_tables(thd, *tables, counter, flags))
+  {
+    SPIDER_sys_close_thread_tables(thd);
+    SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
     thd->utime_after_lock = utime_after_lock_backup;
     DBUG_RETURN(TRUE);
   }
@@ -666,13 +657,15 @@ bool spider_sys_open_tables(
 TABLE *spider_sys_open_table(
   THD *thd,
   TABLE_LIST *tables,
-  Open_tables_backup *open_tables_backup
+  SPIDER_Open_tables_backup *open_tables_backup
 ) {
   TABLE *table;
   ulonglong utime_after_lock_backup = thd->utime_after_lock;
   DBUG_ENTER("spider_sys_open_table");
   if (open_tables_backup)
-    thd->reset_n_backup_open_tables_state(open_tables_backup);
+  {
+    SPIDER_reset_n_backup_open_tables_state(thd, open_tables_backup, NULL);
+  }
   if ((table = open_ltable(thd, tables, tables->lock_type,
     MYSQL_OPEN_IGNORE_GLOBAL_READ_LOCK | MYSQL_LOCK_IGNORE_GLOBAL_READ_ONLY |
     MYSQL_OPEN_IGNORE_FLUSH | MYSQL_LOCK_IGNORE_TIMEOUT | MYSQL_LOCK_LOG_TABLE
@@ -680,19 +673,23 @@ TABLE *spider_sys_open_table(
     table->use_all_columns();
     table->s->no_replicate = 1;
   } else if (open_tables_backup)
-    thd->restore_backup_open_tables_state(open_tables_backup);
+  {
+    SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
+  }
   thd->utime_after_lock = utime_after_lock_backup;
   DBUG_RETURN(table);
 }
 
 void spider_sys_close_table(
   THD *thd,
-  Open_tables_backup *open_tables_backup
+  SPIDER_Open_tables_backup *open_tables_backup
 ) {
   DBUG_ENTER("spider_sys_close_table");
-  close_thread_tables(thd);
   if (open_tables_backup)
-    thd->restore_backup_open_tables_state(open_tables_backup);
+  {
+    SPIDER_sys_close_thread_tables(thd);
+    SPIDER_restore_backup_open_tables_state(thd, open_tables_backup);
+  }
   DBUG_VOID_RETURN;
 }
 #endif
@@ -1106,6 +1103,28 @@ void spider_store_xa_member_info(
     table->field[SPIDER_XA_MEMBER_DSN_POS]->set_null();
     table->field[SPIDER_XA_MEMBER_DSN_POS]->reset();
   }
+  if (conn->tgt_filedsn)
+  {
+    table->field[SPIDER_XA_MEMBER_FILEDSN_POS]->set_notnull();
+    table->field[SPIDER_XA_MEMBER_FILEDSN_POS]->store(
+      conn->tgt_filedsn,
+      (uint) conn->tgt_filedsn_length,
+      system_charset_info);
+  } else {
+    table->field[SPIDER_XA_MEMBER_FILEDSN_POS]->set_null();
+    table->field[SPIDER_XA_MEMBER_FILEDSN_POS]->reset();
+  }
+  if (conn->tgt_driver)
+  {
+    table->field[SPIDER_XA_MEMBER_DRIVER_POS]->set_notnull();
+    table->field[SPIDER_XA_MEMBER_DRIVER_POS]->store(
+      conn->tgt_driver,
+      (uint) conn->tgt_driver_length,
+      system_charset_info);
+  } else {
+    table->field[SPIDER_XA_MEMBER_DRIVER_POS]->set_null();
+    table->field[SPIDER_XA_MEMBER_DRIVER_POS]->reset();
+  }
   DBUG_VOID_RETURN;
 }
 
@@ -1419,6 +1438,28 @@ void spider_store_tables_connect_info(
   } else {
     table->field[SPIDER_TABLES_DSN_POS]->set_null();
     table->field[SPIDER_TABLES_DSN_POS]->reset();
+  }
+  if (alter_table->tmp_tgt_filedsns[link_idx])
+  {
+    table->field[SPIDER_TABLES_FILEDSN_POS]->set_notnull();
+    table->field[SPIDER_TABLES_FILEDSN_POS]->store(
+      alter_table->tmp_tgt_filedsns[link_idx],
+      (uint) alter_table->tmp_tgt_filedsns_lengths[link_idx],
+      system_charset_info);
+  } else {
+    table->field[SPIDER_TABLES_FILEDSN_POS]->set_null();
+    table->field[SPIDER_TABLES_FILEDSN_POS]->reset();
+  }
+  if (alter_table->tmp_tgt_drivers[link_idx])
+  {
+    table->field[SPIDER_TABLES_DRIVER_POS]->set_notnull();
+    table->field[SPIDER_TABLES_DRIVER_POS]->store(
+      alter_table->tmp_tgt_drivers[link_idx],
+      (uint) alter_table->tmp_tgt_drivers_lengths[link_idx],
+      system_charset_info);
+  } else {
+    table->field[SPIDER_TABLES_DRIVER_POS]->set_null();
+    table->field[SPIDER_TABLES_DRIVER_POS]->reset();
   }
   if (alter_table->tmp_tgt_dbs[link_idx])
   {
@@ -2405,6 +2446,28 @@ int spider_get_sys_server_info(
     share->tgt_dsns_lengths[link_idx] = 0;
     share->tgt_dsns[link_idx] = NULL;
   }
+  if (
+    !table->field[SPIDER_XA_MEMBER_FILEDSN_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_XA_MEMBER_FILEDSN_POS]))
+  ) {
+    share->tgt_filedsns_lengths[link_idx] = strlen(ptr);
+    share->tgt_filedsns[link_idx] =
+      spider_create_string(ptr, share->tgt_filedsns_lengths[link_idx]);
+  } else {
+    share->tgt_filedsns_lengths[link_idx] = 0;
+    share->tgt_filedsns[link_idx] = NULL;
+  }
+  if (
+    !table->field[SPIDER_XA_MEMBER_DRIVER_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_XA_MEMBER_DRIVER_POS]))
+  ) {
+    share->tgt_drivers_lengths[link_idx] = strlen(ptr);
+    share->tgt_drivers[link_idx] =
+      spider_create_string(ptr, share->tgt_drivers_lengths[link_idx]);
+  } else {
+    share->tgt_drivers_lengths[link_idx] = 0;
+    share->tgt_drivers[link_idx] = NULL;
+  }
   DBUG_RETURN(0);
 }
 
@@ -2664,6 +2727,28 @@ int spider_get_sys_tables_connect_info(
     share->tgt_dsns[link_idx] = NULL;
   }
   if (
+    !table->field[SPIDER_TABLES_FILEDSN_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_TABLES_FILEDSN_POS]))
+  ) {
+    share->tgt_filedsns_lengths[link_idx] = strlen(ptr);
+    share->tgt_filedsns[link_idx] =
+      spider_create_string(ptr, share->tgt_filedsns_lengths[link_idx]);
+  } else {
+    share->tgt_filedsns_lengths[link_idx] = 0;
+    share->tgt_filedsns[link_idx] = NULL;
+  }
+  if (
+    !table->field[SPIDER_TABLES_DRIVER_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_TABLES_DRIVER_POS]))
+  ) {
+    share->tgt_drivers_lengths[link_idx] = strlen(ptr);
+    share->tgt_drivers[link_idx] =
+      spider_create_string(ptr, share->tgt_drivers_lengths[link_idx]);
+  } else {
+    share->tgt_drivers_lengths[link_idx] = 0;
+    share->tgt_drivers[link_idx] = NULL;
+  }
+  if (
     !table->field[SPIDER_TABLES_TGT_DB_NAME_POS]->is_null() &&
     (ptr = get_field(mem_root, table->field[SPIDER_TABLES_TGT_DB_NAME_POS]))
   ) {
@@ -2879,11 +2964,7 @@ int spider_sys_update_tables_link_status(
 ) {
   int error_num;
   TABLE *table_tables = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_update_tables_link_status");
   if (
     !(table_tables = spider_open_sys_table(
@@ -2917,11 +2998,7 @@ int spider_sys_log_tables_link_failed(
 ) {
   int error_num;
   TABLE *table_tables = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_log_tables_link_failed");
   if (
     !(table_tables = spider_open_sys_table(
@@ -2956,11 +3033,7 @@ int spider_sys_log_xa_failed(
 ) {
   int error_num;
   TABLE *table_tables = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_log_xa_failed");
   if (
     !(table_tables = spider_open_sys_table(
@@ -3259,6 +3332,28 @@ int spider_get_sys_link_mon_connect_info(
     share->tgt_dsns_lengths[link_idx] = 0;
     share->tgt_dsns[link_idx] = NULL;
   }
+  if (
+    !table->field[SPIDER_LINK_MON_SERVERS_FILEDSN_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_LINK_MON_SERVERS_FILEDSN_POS]))
+  ) {
+    share->tgt_filedsns_lengths[link_idx] = strlen(ptr);
+    share->tgt_filedsns[link_idx] =
+      spider_create_string(ptr, share->tgt_filedsns_lengths[link_idx]);
+  } else {
+    share->tgt_filedsns_lengths[link_idx] = 0;
+    share->tgt_filedsns[link_idx] = NULL;
+  }
+  if (
+    !table->field[SPIDER_LINK_MON_SERVERS_DRIVER_POS]->is_null() &&
+    (ptr = get_field(mem_root, table->field[SPIDER_LINK_MON_SERVERS_DRIVER_POS]))
+  ) {
+    share->tgt_drivers_lengths[link_idx] = strlen(ptr);
+    share->tgt_drivers[link_idx] =
+      spider_create_string(ptr, share->tgt_drivers_lengths[link_idx]);
+  } else {
+    share->tgt_drivers_lengths[link_idx] = 0;
+    share->tgt_drivers[link_idx] = NULL;
+  }
   DBUG_RETURN(error_num);
 }
 
@@ -3305,11 +3400,7 @@ int spider_sys_insert_or_update_table_sts(
 ) {
   int error_num;
   TABLE *table_sts = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_insert_or_update_table_sts");
   if (
     !(table_sts = spider_open_sys_table(
@@ -3346,11 +3437,7 @@ int spider_sys_insert_or_update_table_crd(
 ) {
   int error_num;
   TABLE *table_crd = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_insert_or_update_table_crd");
   if (
     !(table_crd = spider_open_sys_table(
@@ -3386,11 +3473,7 @@ int spider_sys_delete_table_sts(
 ) {
   int error_num;
   TABLE *table_sts = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_delete_table_sts");
   if (
     !(table_sts = spider_open_sys_table(
@@ -3424,11 +3507,7 @@ int spider_sys_delete_table_crd(
 ) {
   int error_num;
   TABLE *table_crd = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_delete_table_crd");
   if (
     !(table_crd = spider_open_sys_table(
@@ -3464,11 +3543,7 @@ int spider_sys_get_table_sts(
   int error_num;
   char table_key[MAX_KEY_LENGTH];
   TABLE *table_sts = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#else
-  Open_tables_backup open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_get_table_sts");
   if (
     !(table_sts = spider_open_sys_table(
@@ -3517,17 +3592,14 @@ int spider_sys_get_table_crd(
   char table_key[MAX_KEY_LENGTH];
   bool index_inited = FALSE;
   TABLE *table_crd = NULL;
-#if MYSQL_VERSION_ID < 50500
-  Open_tables_state open_tables_backup;
-#endif
+  SPIDER_Open_tables_backup open_tables_backup;
   DBUG_ENTER("spider_sys_get_table_crd");
 
-  start_new_trans new_trans(thd);
   if (
     !(table_crd = spider_open_sys_table(
       thd, SPIDER_SYS_TABLE_CRD_TABLE_NAME_STR,
       SPIDER_SYS_TABLE_CRD_TABLE_NAME_LEN, TRUE,
-      0, need_lock, &error_num))
+      &open_tables_backup, need_lock, &error_num))
   ) {
     goto error;
   }
@@ -3560,8 +3632,8 @@ int spider_sys_get_table_crd(
     goto error;
   }
 
-  thd->commit_whole_transaction_and_close_tables();
-  new_trans.restore_old_transaction();
+  spider_close_sys_table(thd, table_crd, &open_tables_backup, need_lock);
+  table_crd = NULL;
   DBUG_RETURN(0);
 
 error:
@@ -3569,8 +3641,7 @@ error:
     spider_sys_index_end(table_crd);
 
   if (table_crd)
-    thd->commit_whole_transaction_and_close_tables();
-  new_trans.restore_old_transaction();
+    spider_close_sys_table(thd, table_crd, &open_tables_backup, need_lock);
   DBUG_RETURN(error_num);
 }
 

@@ -215,7 +215,7 @@ SORT_INFO *filesort(THD *thd, TABLE *table, Filesort *filesort,
 
   DBUG_EXECUTE("info",TEST_filesort(filesort->sortorder, s_length););
 #ifdef SKIP_DBUG_IN_FILESORT
-  DBUG_PUSH("");		/* No DBUG here */
+  DBUG_PUSH_EMPTY;		/* No DBUG here */
 #endif
   SORT_INFO *sort;
   TABLE_LIST *tab= table->pos_in_table_list;
@@ -316,7 +316,8 @@ SORT_INFO *filesort(THD *thd, TABLE *table, Filesort *filesort,
     while (memory_available >= min_sort_memory)
     {
       ulonglong keys= memory_available / (param.rec_length + sizeof(char*));
-      param.max_keys_per_buffer= (uint) MY_MIN(num_rows, keys);
+      param.max_keys_per_buffer= (uint) MY_MAX(MERGEBUFF2,
+                                               MY_MIN(num_rows, keys));
       sort->alloc_sort_buffer(param.max_keys_per_buffer, param.rec_length);
       if (sort->sort_buffer_size() > 0)
         break;
@@ -495,7 +496,7 @@ SORT_INFO *filesort(THD *thd, TABLE *table, Filesort *filesort,
   sort->examined_rows= param.examined_rows;
   sort->return_rows= num_rows;
 #ifdef SKIP_DBUG_IN_FILESORT
-  DBUG_POP();			/* Ok to DBUG */
+  DBUG_POP_EMPTY;		/* Ok to DBUG */
 #endif
 
   DBUG_PRINT("exit",
@@ -983,12 +984,12 @@ static ha_rows find_all_keys(THD *thd, Sort_param *param, SQL_SELECT *select,
   }
   if (!quick_select)
   {
-    (void) file->extra(HA_EXTRA_NO_CACHE);	/* End cacheing of records */
+    (void) file->extra(HA_EXTRA_NO_CACHE);	/* End caching of records */
     if (!next_pos)
       file->ha_rnd_end();
   }
 
-  /* Signal we should use orignal column read and write maps */
+  /* Signal we should use original column read and write maps */
   sort_form->column_bitmaps_set(save_read_set, save_write_set);
 
   if (unlikely(thd->is_error()))
@@ -2110,9 +2111,7 @@ Type_handler_string_result::sort_length(THD *thd,
                                        SORT_FIELD_ATTR *sortorder) const
 {
   CHARSET_INFO *cs;
-  sortorder->length= item->max_length;
-  set_if_smaller(sortorder->length, thd->variables.max_sort_length);
-  sortorder->original_length= item->max_length;
+  sortorder->set_length_and_original_length(thd, item->max_length);
 
   if (use_strnxfrm((cs= item->collation.collation)))
   {
@@ -2209,6 +2208,12 @@ sortlength(THD *thd, Sort_keys *sort_keys, bool *allow_packing_for_sortkeys)
   length=0;
   uint nullable_cols=0;
 
+  if (sort_keys->is_parameters_computed())
+  {
+    *allow_packing_for_sortkeys= sort_keys->using_packed_sortkeys();
+    return sort_keys->get_sort_length_with_memcmp_values();
+  }
+
   for (SORT_FIELD *sortorder= sort_keys->begin();
        sortorder != sort_keys->end();
        sortorder++)
@@ -2219,12 +2224,11 @@ sortlength(THD *thd, Sort_keys *sort_keys, bool *allow_packing_for_sortkeys)
     {
       Field *field= sortorder->field;
       CHARSET_INFO *cs= sortorder->field->sort_charset();
-      sortorder->length= sortorder->field->sort_length();
-      sortorder->suffix_length= sortorder->field->sort_suffix_length();
-      sortorder->original_length= sortorder->length;
       sortorder->type= field->is_packable() ?
                        SORT_FIELD_ATTR::VARIABLE_SIZE :
                        SORT_FIELD_ATTR::FIXED_SIZE;
+      sortorder->set_length_and_original_length(thd, field->sort_length());
+      sortorder->suffix_length= sortorder->field->sort_suffix_length();
       sortorder->cs= cs;
 
       if (use_strnxfrm((cs=sortorder->field->sort_charset())))
@@ -2243,11 +2247,11 @@ sortlength(THD *thd, Sort_keys *sort_keys, bool *allow_packing_for_sortkeys)
     }
     else
     {
-      sortorder->item->type_handler()->sort_length(thd, sortorder->item,
-                                                   sortorder);
       sortorder->type= sortorder->item->type_handler()->is_packable() ?
                        SORT_FIELD_ATTR::VARIABLE_SIZE :
                        SORT_FIELD_ATTR::FIXED_SIZE;
+      sortorder->item->type_handler()->sort_length(thd, sortorder->item,
+                                                   sortorder);
       sortorder->cs= sortorder->item->collation.collation;
       if (sortorder->is_variable_sized() && allow_packing_for_keys)
       {
@@ -2260,8 +2264,11 @@ sortlength(THD *thd, Sort_keys *sort_keys, bool *allow_packing_for_sortkeys)
       if ((sortorder->maybe_null= sortorder->item->maybe_null))
         nullable_cols++;				// Place for NULL marker
     }
-    set_if_smaller(sortorder->length, thd->variables.max_sort_length);
-    set_if_smaller(sortorder->original_length, thd->variables.max_sort_length);
+    if (sortorder->is_variable_sized())
+    {
+      set_if_smaller(sortorder->length, thd->variables.max_sort_length);
+      set_if_smaller(sortorder->original_length, thd->variables.max_sort_length);
+    }
     length+=sortorder->length;
 
     sort_keys->increment_size_of_packable_fields(sortorder->length_bytes);
@@ -2270,6 +2277,8 @@ sortlength(THD *thd, Sort_keys *sort_keys, bool *allow_packing_for_sortkeys)
   // add bytes for nullable_cols
   sort_keys->increment_original_sort_length(nullable_cols);
   *allow_packing_for_sortkeys= allow_packing_for_keys;
+  sort_keys->set_sort_length_with_memcmp_values(length + nullable_cols);
+  sort_keys->set_parameters_computed(true);
   DBUG_PRINT("info",("sort_length: %d",length));
   return length + nullable_cols;
 }
@@ -2528,7 +2537,7 @@ void Sort_param::try_to_pack_sortkeys()
     return;
 
   const uint sz= Sort_keys::size_of_length_field;
-  uint sort_len= sort_keys->get_sort_length();
+  uint sort_len= sort_keys->get_sort_length_with_original_values();
 
   /*
     Heuristic introduced, skip packing sort keys if saving less than 128 bytes
@@ -2560,7 +2569,7 @@ Type_handler_string_result::make_packed_sort_key_part(uchar *to, Item *item,
   if (maybe_null)
     *to++= 1;
 
-  String *res= item->str_result(&param->tmp_buffer);
+  Binary_string *res= item->str_result(&param->tmp_buffer);
   if (!res)
   {
     if (maybe_null)
@@ -2584,7 +2593,7 @@ Type_handler_string_result::make_packed_sort_key_part(uchar *to, Item *item,
       return sort_field->original_length;
     }
   }
-  return sort_field->pack_sort_string(to, res->lex_cstring(), cs);
+  return sort_field->pack_sort_string(to, res, cs);
 }
 
 
@@ -2754,6 +2763,15 @@ bool SORT_FIELD_ATTR::check_if_packing_possible(THD *thd) const
       cs->state & MY_CS_NON1TO1)
     return false;
   return true;
+}
+
+
+void SORT_FIELD_ATTR::set_length_and_original_length(THD *thd, uint length_arg)
+{
+  length= length_arg;
+  if (is_variable_sized())
+    set_if_smaller(length, thd->variables.max_sort_length);
+  original_length= length_arg;
 }
 
 
@@ -2940,13 +2958,13 @@ int compare_packed_sort_keys(void *sort_param,
 */
 
 uint
-SORT_FIELD_ATTR::pack_sort_string(uchar *to, const LEX_CSTRING &str,
+SORT_FIELD_ATTR::pack_sort_string(uchar *to, const Binary_string *str,
                                   CHARSET_INFO *cs) const
 {
   uchar *orig_to= to;
   uint32 length, data_length;
-  DBUG_ASSERT(str.length <= UINT32_MAX);
-  length= (uint32)str.length;
+  DBUG_ASSERT(str->length() <= UINT32_MAX);
+  length= (uint32) str->length();
 
   if (length + suffix_length <= original_length)
     data_length= length;
@@ -2957,13 +2975,13 @@ SORT_FIELD_ATTR::pack_sort_string(uchar *to, const LEX_CSTRING &str,
   store_key_part_length(data_length + suffix_length, to, length_bytes);
   to+= length_bytes;
   // copying data length bytes to the buffer
-  memcpy(to, (uchar*)str.str, data_length);
+  memcpy(to, (uchar*)str->ptr(), data_length);
   to+= data_length;
 
   if (cs == &my_charset_bin && suffix_length)
   {
     // suffix length stored in bigendian form
-    store_bigendian(str.length, to, suffix_length);
+    store_bigendian(length, to, suffix_length);
     to+= suffix_length;
   }
   return static_cast<uint>(to - orig_to);

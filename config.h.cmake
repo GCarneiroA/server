@@ -42,6 +42,7 @@
 #cmakedefine HAVE_LIMITS_H 1
 #cmakedefine HAVE_LINK_H 1
 #cmakedefine HAVE_LINUX_UNISTD_H 1
+#cmakedefine HAVE_LINUX_MMAN_H 1
 #cmakedefine HAVE_LOCALE_H 1
 #cmakedefine HAVE_MALLOC_H 1
 #cmakedefine HAVE_MEMORY_H 1
@@ -102,12 +103,6 @@
 /* Libraries */
 #cmakedefine HAVE_LIBWRAP 1
 #cmakedefine HAVE_SYSTEMD 1
-#cmakedefine HAVE_CRC32_VPMSUM 1
-
-/* Support ARMv8 crc + crypto  */
-#cmakedefine HAVE_ARMV8_CRC 1
-#cmakedefine HAVE_ARMV8_CRYPTO 1
-#cmakedefine HAVE_ARMV8_CRC_CRYPTO_INTRINSICS 1
 
 /* Does "struct timespec" have a "sec" and "nsec" field? */
 #cmakedefine HAVE_TIMESPEC_TS_SEC 1
@@ -242,7 +237,6 @@
 /* Symbols we may use */
 #cmakedefine HAVE_SYS_ERRLIST 1
 /* used by stacktrace functions */
-#cmakedefine HAVE_BSS_START 1
 #cmakedefine HAVE_BACKTRACE 1
 #cmakedefine HAVE_BACKTRACE_SYMBOLS 1
 #cmakedefine HAVE_BACKTRACE_SYMBOLS_FD 1

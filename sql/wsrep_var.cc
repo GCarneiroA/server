@@ -97,12 +97,6 @@ static void wsrep_set_wsrep_on()
     strcmp(wsrep_provider, WSREP_NONE);
 }
 
-/* This is intentionally declared as a weak global symbol, so that
-linking will succeed even if the server is built with a dynamically
-linked InnoDB. */
-ulong innodb_lock_schedule_algorithm __attribute__((weak));
-struct handlerton* innodb_hton_ptr __attribute__((weak));
-
 bool wsrep_on_update (sys_var *self, THD* thd, enum_var_type var_type)
 {
   if (var_type == OPT_GLOBAL) {
@@ -138,18 +132,7 @@ bool wsrep_on_update (sys_var *self, THD* thd, enum_var_type var_type)
 
 bool wsrep_on_check(sys_var *self, THD* thd, set_var* var)
 {
-  bool new_wsrep_on= (bool)var->save_result.ulonglong_value;
-
-  if (check_has_super(self, thd, var))
-    return true;
-
-  if (new_wsrep_on && innodb_hton_ptr && innodb_lock_schedule_algorithm != 0) {
-    my_message(ER_WRONG_ARGUMENTS, " WSREP (galera) can't be enabled "
-            "if innodb_lock_schedule_algorithm=VATS. Please configure"
-            " innodb_lock_schedule_algorithm=FCFS and restart.", MYF(0));
-    return true;
-  }
-  return false;
+  return check_has_super(self, thd, var);
 }
 
 bool wsrep_causal_reads_update (sys_var *self, THD* thd, enum_var_type var_type)
@@ -360,6 +343,12 @@ static int wsrep_provider_verify (const char* provider_str)
   {
     return 1;
   }
+
+  if (MY_S_ISDIR(f_stat.st_mode))
+  {
+    return 1;
+  }
+
   return 0;
 }
 
@@ -932,7 +921,8 @@ static void export_wsrep_status_to_mysql(THD* thd)
   mysql_status_vars[wsrep_status_len].type  = SHOW_LONG;
 }
 
-int wsrep_show_status (THD *thd, SHOW_VAR *var, char *buff)
+int wsrep_show_status (THD *thd, SHOW_VAR *var, void *,
+                       system_status_var *, enum_var_type)
 {
   /* Note that we should allow show status like 'wsrep%' even
   when WSREP(thd) is false. */
@@ -941,6 +931,11 @@ int wsrep_show_status (THD *thd, SHOW_VAR *var, char *buff)
     export_wsrep_status_to_mysql(thd);
     var->type= SHOW_ARRAY;
     var->value= (char *) &mysql_status_vars;
+  }
+  else
+  {
+    var->type= SHOW_CHAR;
+    var->value= (char*) "0";
   }
   return 0;
 }

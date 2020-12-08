@@ -262,7 +262,7 @@ dict_table_try_drop_aborted(
 	}
 
 	row_mysql_unlock_data_dictionary(trx);
-	trx_free(trx);
+	trx->free();
 }
 
 /**********************************************************************//**
@@ -884,7 +884,7 @@ is_unaccessible:
     return nullptr;
   }
 
-  if (!fil_table_accessible(table))
+  if (!table->is_accessible())
     goto is_unaccessible;
 
   size_t db1_len, tbl1_len;
@@ -1038,7 +1038,7 @@ void dict_sys_t::create()
   table_id_hash.create(hash_size);
   temp_id_hash.create(hash_size);
 
-  rw_lock_create(dict_operation_lock_key, &latch, SYNC_DICT_OPERATION);
+  latch.SRW_LOCK_INIT(dict_operation_lock_key);
 
   if (!srv_read_only_mode)
   {
@@ -1193,7 +1193,7 @@ inline void dict_sys_t::add(dict_table_t* table)
 
 	ulint fold = ut_fold_string(table->name.m_name);
 
-	mutex_create(LATCH_ID_AUTOINC, &table->autoinc_mutex);
+	new (&table->autoinc_mutex) std::mutex();
 
 	/* Look for a table with the same name: error if such exists */
 	{
@@ -1305,10 +1305,10 @@ dict_index_t *dict_index_t::clone() const
               sizeof *stat_n_non_null_key_vals);
 
   mem_heap_t* heap= mem_heap_create(size);
-  dict_index_t *index= static_cast<dict_index_t*>(mem_heap_dup(heap, this,
-                                                               sizeof *this));
+  dict_index_t *index= static_cast<dict_index_t*>
+    (mem_heap_alloc(heap, sizeof *this));
   *index= *this;
-  rw_lock_create(index_tree_rw_lock_key, &index->lock, SYNC_INDEX_TREE);
+  index->lock.SRW_LOCK_INIT(index_tree_rw_lock_key);
   index->heap= heap;
   index->name= mem_heap_strdup(heap, name);
   index->fields= static_cast<dict_field_t*>
@@ -1322,7 +1322,7 @@ dict_index_t *dict_index_t::clone() const
     (mem_heap_zalloc(heap, n_uniq * sizeof *stat_n_sample_sizes));
   index->stat_n_non_null_key_vals= static_cast<ib_uint64_t*>
     (mem_heap_zalloc(heap, n_uniq * sizeof *stat_n_non_null_key_vals));
-  mutex_create(LATCH_ID_ZIP_PAD_MUTEX, &index->zip_pad.mutex);
+  new (&index->zip_pad.mutex) std::mutex();
   return index;
 }
 
@@ -1975,7 +1975,7 @@ void dict_sys_t::remove(dict_table_t* table, bool lru, bool keep)
 		row_merge_drop_indexes_dict(trx, table->id);
 		trx_commit_for_mysql(trx);
 		trx->dict_operation_lock_mode = 0;
-		trx_free(trx);
+		trx->free();
 	}
 
 	/* Free virtual column template if any */
@@ -1984,7 +1984,7 @@ void dict_sys_t::remove(dict_table_t* table, bool lru, bool keep)
 		UT_DELETE(table->vc_templ);
 	}
 
-	mutex_free(&table->autoinc_mutex);
+	table->autoinc_mutex.~mutex();
 
 	if (keep) {
 		return;
@@ -1992,6 +1992,12 @@ void dict_sys_t::remove(dict_table_t* table, bool lru, bool keep)
 
 #ifdef BTR_CUR_HASH_ADAPT
 	if (UNIV_UNLIKELY(UT_LIST_GET_LEN(table->freed_indexes) != 0)) {
+		if (table->fts) {
+			fts_optimize_remove_table(table);
+			fts_free(table);
+			table->fts = NULL;
+		}
+
 		table->vc_templ = NULL;
 		table->id = 0;
 		return;
@@ -2151,8 +2157,7 @@ dict_index_add_to_cache(
 #endif /* BTR_CUR_ADAPT */
 
 	new_index->page = unsigned(page_no);
-	rw_lock_create(index_tree_rw_lock_key, &new_index->lock,
-		       SYNC_INDEX_TREE);
+	new_index->lock.SRW_LOCK_INIT(index_tree_rw_lock_key);
 
 	new_index->n_core_fields = new_index->n_fields;
 
@@ -2187,6 +2192,7 @@ dict_index_remove_from_cache_low(
 	if (index->online_log) {
 		ut_ad(index->online_status == ONLINE_INDEX_CREATION);
 		row_log_free(index->online_log);
+		index->online_log = NULL;
 	}
 
 	/* Remove the index from the list of indexes of the table */
@@ -2221,7 +2227,7 @@ dict_index_remove_from_cache_low(
 	}
 #endif /* BTR_CUR_HASH_ADAPT */
 
-	rw_lock_free(&index->lock);
+	index->lock.free();
 
 	dict_mem_index_free(index);
 }
@@ -2353,7 +2359,6 @@ dict_index_add_col(
 	if (col->is_virtual()) {
 		dict_v_col_t*	v_col = reinterpret_cast<dict_v_col_t*>(col);
 		/* Register the index with the virtual column index list */
-		v_col->n_v_indexes++;
 		v_col->v_indexes.push_front(dict_v_idx_t(index, index->n_def));
 		col_name = dict_table_get_v_col_name_mysql(
 			table, dict_col_get_no(col));
@@ -2798,10 +2803,10 @@ dict_index_build_internal_fts(
 		table->fts->cache = fts_cache_create(table);
 	}
 
-	rw_lock_x_lock(&table->fts->cache->init_lock);
+	mysql_mutex_lock(&table->fts->cache->init_lock);
 	/* Notify the FTS cache about this index. */
 	fts_cache_index_cache_create(table, new_index);
-	rw_lock_x_unlock(&table->fts->cache->init_lock);
+	mysql_mutex_unlock(&table->fts->cache->init_lock);
 
 	return(new_index);
 }
@@ -4274,8 +4279,7 @@ dict_set_corrupted(
 	dict_index_copy_types(tuple, sys_index, 2);
 
 	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_LE,
-				    BTR_MODIFY_LEAF,
-				    &cursor, 0, __FILE__, __LINE__, &mtr);
+				    BTR_MODIFY_LEAF, &cursor, 0, &mtr);
 
 	if (cursor.low_match == dtuple_get_n_fields(tuple)) {
 		/* UPDATE SYS_INDEXES SET TYPE=index->type
@@ -4324,6 +4328,7 @@ dict_set_corrupted_index_cache_only(
 	is corrupted */
 	if (dict_index_is_clust(index)) {
 		index->table->corrupted = TRUE;
+		index->table->file_unreadable = true;
 	}
 
 	index->type |= DICT_CORRUPT;
@@ -4375,8 +4380,7 @@ dict_index_set_merge_threshold(
 	dict_index_copy_types(tuple, sys_index, 2);
 
 	btr_cur_search_to_nth_level(sys_index, 0, tuple, PAGE_CUR_GE,
-				    BTR_MODIFY_LEAF,
-				    &cursor, 0, __FILE__, __LINE__, &mtr);
+				    BTR_MODIFY_LEAF, &cursor, 0, &mtr);
 
 	if (cursor.up_match == dtuple_get_n_fields(tuple)
 	    && rec_get_n_fields_old(btr_cur_get_rec(&cursor))
@@ -4412,10 +4416,10 @@ dict_set_merge_threshold_list_debug(
 		for (dict_index_t* index = UT_LIST_GET_FIRST(table->indexes);
 		     index != NULL;
 		     index = UT_LIST_GET_NEXT(indexes, index)) {
-			rw_lock_x_lock(dict_index_get_lock(index));
+			index->lock.x_lock(SRW_LOCK_CALL);
 			index->merge_threshold = merge_threshold_all
 				& ((1U << 6) - 1);
-			rw_lock_x_unlock(dict_index_get_lock(index));
+			index->lock.x_unlock();
 		}
 	}
 }
@@ -4944,7 +4948,7 @@ void dict_sys_t::close()
 
   mutex_exit(&mutex);
   mutex_free(&mutex);
-  rw_lock_free(&latch);
+  latch.destroy();
 
   mutex_free(&dict_foreign_err_mutex);
 
@@ -5026,7 +5030,11 @@ dict_foreign_qualify_index(
 		return(false);
 	}
 
-	if (index->type & (DICT_SPATIAL | DICT_FTS)) {
+	if (index->type & (DICT_SPATIAL | DICT_FTS | DICT_CORRUPT)) {
+		return false;
+	}
+
+	if (index->online_status >= ONLINE_INDEX_ABORTED) {
 		return false;
 	}
 
@@ -5180,10 +5188,10 @@ dict_index_zip_success(
 		return;
 	}
 
-	mutex_enter(&index->zip_pad.mutex);
+	index->zip_pad.mutex.lock();
 	++index->zip_pad.success;
 	dict_index_zip_pad_update(&index->zip_pad, zip_threshold);
-	mutex_exit(&index->zip_pad.mutex);
+	index->zip_pad.mutex.unlock();
 }
 
 /*********************************************************************//**
@@ -5200,10 +5208,10 @@ dict_index_zip_failure(
 		return;
 	}
 
-	mutex_enter(&index->zip_pad.mutex);
+	index->zip_pad.mutex.lock();
 	++index->zip_pad.failure;
 	dict_index_zip_pad_update(&index->zip_pad, zip_threshold);
-	mutex_exit(&index->zip_pad.mutex);
+	index->zip_pad.mutex.unlock();
 }
 
 /*********************************************************************//**
@@ -5257,88 +5265,4 @@ dict_tf_to_row_format_string(
 
 	ut_error;
 	return(0);
-}
-
-/** Look for any dictionary objects that are found in the given tablespace.
-@param[in]	space_id	Tablespace ID to search for.
-@return true if tablespace is empty. */
-bool
-dict_space_is_empty(
-	ulint	space_id)
-{
-	btr_pcur_t	pcur;
-	const rec_t*	rec;
-	mtr_t		mtr;
-	bool		found = false;
-
-	dict_sys_lock();
-	mtr_start(&mtr);
-
-	for (rec = dict_startscan_system(&pcur, &mtr, SYS_TABLES);
-	     rec != NULL;
-	     rec = dict_getnext_system(&pcur, &mtr)) {
-		const byte*	field;
-		ulint		len;
-		ulint		space_id_for_table;
-
-		field = rec_get_nth_field_old(
-			rec, DICT_FLD__SYS_TABLES__SPACE, &len);
-		ut_ad(len == 4);
-		space_id_for_table = mach_read_from_4(field);
-
-		if (space_id_for_table == space_id) {
-			found = true;
-		}
-	}
-
-	mtr_commit(&mtr);
-	dict_sys_unlock();
-
-	return(!found);
-}
-
-/** Find the space_id for the given name in sys_tablespaces.
-@param[in]	name	Tablespace name to search for.
-@return the tablespace ID. */
-ulint
-dict_space_get_id(
-	const char*	name)
-{
-	btr_pcur_t	pcur;
-	const rec_t*	rec;
-	mtr_t		mtr;
-	ulint		name_len = strlen(name);
-	ulint		id = ULINT_UNDEFINED;
-
-	dict_sys_lock();
-	mtr_start(&mtr);
-
-	for (rec = dict_startscan_system(&pcur, &mtr, SYS_TABLESPACES);
-	     rec != NULL;
-	     rec = dict_getnext_system(&pcur, &mtr)) {
-		const byte*	field;
-		ulint		len;
-
-		field = rec_get_nth_field_old(
-			rec, DICT_FLD__SYS_TABLESPACES__NAME, &len);
-		ut_ad(len > 0);
-		ut_ad(len < OS_FILE_MAX_PATH);
-
-		if (len == name_len && !memcmp(name, field, len)) {
-			field = rec_get_nth_field_old(
-				rec, DICT_FLD__SYS_TABLESPACES__SPACE, &len);
-			ut_ad(len == 4);
-			id = mach_read_from_4(field);
-
-			/* This is normally called by dict_getnext_system()
-			at the end of the index. */
-			btr_pcur_close(&pcur);
-			break;
-		}
-	}
-
-	mtr_commit(&mtr);
-	dict_sys_unlock();
-
-	return(id);
 }

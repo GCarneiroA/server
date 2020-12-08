@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 2007, 2015, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2017, 2019, MariaDB Corporation.
+Copyright (c) 2017, 2020, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -31,6 +31,7 @@ Created July 17, 2007 Vasil Dimov
 
 #include "trx0types.h"
 #include "dict0types.h"
+#include "buf0types.h"
 
 /** The maximum amount of memory that can be consumed by innodb_trx,
 innodb_locks and innodb_lock_waits information schema tables. */
@@ -90,10 +91,8 @@ struct i_s_locks_row_t {
 					lock_get_table_name() */
 	/** index name of a record lock; NULL for table locks */
 	const char*	lock_index;
-	/** tablespace identifier of the record; 0 if !lock_index */
-	uint32_t	lock_space;
-	/** page number of the record; 0 if !lock_index */
-	uint32_t	lock_page;
+	/** page identifier of the record; (0,0) if !lock_index */
+	page_id_t	lock_page;
 	/** heap number of the record; 0 if !lock_index */
 	uint16_t	lock_rec;
 	/** lock mode corresponding to lock_mode_values_typelib */
@@ -141,9 +140,6 @@ struct i_s_trx_row_t {
 					trx->lock_heap) */
 	ulint		trx_rows_locked;/*!< lock_number_of_rows_locked() */
 	uintmax_t	trx_rows_modified;/*!< trx_t::undo_no */
-	ulint		trx_concurrency_tickets;
-					/*!< n_tickets_to_enter_innodb in
-					trx_t */
 	uint		trx_isolation_level;
 					/*!< trx_t::isolation_level */
 	bool		trx_unique_checks;

@@ -109,20 +109,22 @@ INCLUDE (CheckIncludeFiles)
 SET(S3_SOURCES s3_func.c
     libmarias3/src/debug.c libmarias3/src/error.c libmarias3/src/marias3.c
     libmarias3/src/request.c libmarias3/src/response.c libmarias3/src/sha256.c
-    libmarias3/src/sha256-internal.c libmarias3/src/xml.c)
+    libmarias3/src/sha256-internal.c libmarias3/src/xml.c
+    libmarias3/src/assume_role.c)
 
 IF(NOT PLUGIN_S3 STREQUAL NO)
   FIND_PACKAGE(CURL)
 ENDIF()
 
 IF (CURL_FOUND)
+  LINK_DIRECTORIES(${PC_CURL_LIBDIR})
   MYSQL_ADD_PLUGIN(s3 ha_s3.cc ${S3_SOURCES} COMPONENT s3-engine
-    LINK_LIBRARIES curl STORAGE_ENGINE NOT_EMBEDDED CONFIG s3.cnf)
+    LINK_LIBRARIES curl z STORAGE_ENGINE NOT_EMBEDDED CONFIG s3.cnf)
 ENDIF()
 
 IF(TARGET s3)
   MYSQL_ADD_EXECUTABLE(aria_s3_copy aria_s3_copy.cc ${S3_SOURCES} COMPONENT s3-engine)
-  TARGET_LINK_LIBRARIES(aria_s3_copy aria myisam mysys mysys_ssl curl)
+  TARGET_LINK_LIBRARIES(aria_s3_copy aria myisam mysys mysys_ssl curl z)
   INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/libmarias3)
   ADD_DEFINITIONS(-DWITH_S3_STORAGE_ENGINE)
 ENDIF()

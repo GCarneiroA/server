@@ -2818,7 +2818,7 @@ static bool wait_for_relay_log_space(Relay_log_info* rli)
       DBUG_PRINT("info", ("log_space_limit=%llu log_space_total=%llu "
                           "ignore_log_space_limit=%d "
                           "sql_force_rotate_relay=%d", 
-                        rli->log_space_limit, rli->log_space_total,
+                        rli->log_space_limit, uint64(rli->log_space_total),
                         (int) rli->ignore_log_space_limit,
                         (int) rli->sql_force_rotate_relay));
     }
@@ -3477,7 +3477,7 @@ static bool send_show_master_info_data(THD *thd, Master_info *mi, bool full,
       protocol->store((ulonglong) mi->rli.max_relay_log_size);
       protocol->store(mi->rli.executed_entries);
       protocol->store((uint32)    mi->received_heartbeats);
-      protocol->store((double)    mi->heartbeat_period, 3, &tmp);
+      protocol->store_double(mi->heartbeat_period, 3);
       protocol->store(gtid_pos->ptr(), gtid_pos->length(), &my_charset_bin);
     }
 
@@ -3727,7 +3727,8 @@ static int request_dump(THD *thd, MYSQL* mysql, Master_info* mi,
       in the future, we should do a better error analysis, but for
       now we just fill up the error log :-)
     */
-    if (mysql_errno(mysql) == ER_NET_READ_INTERRUPTED)
+    if (mysql_errno(mysql) == ER_NET_READ_INTERRUPTED ||
+        mysql_errno(mysql) == ER_NET_ERROR_ON_WRITE)
       *suppress_warnings= TRUE;                 // Suppress reconnect warning
     else
       sql_print_error("Error on COM_BINLOG_DUMP: %d  %s, will retry in %d secs",
@@ -5083,7 +5084,7 @@ Stopping slave I/O thread due to out-of-memory error from master");
       {
         DBUG_PRINT("info", ("log_space_limit=%llu log_space_total=%llu "
                             "ignore_log_space_limit=%d",
-                            rli->log_space_limit, rli->log_space_total,
+                            rli->log_space_limit, uint64(rli->log_space_total),
                             (int) rli->ignore_log_space_limit));
       }
 #endif

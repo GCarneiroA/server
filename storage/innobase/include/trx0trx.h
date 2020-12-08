@@ -68,27 +68,18 @@ trx_get_error_info(
 /*===============*/
 	const trx_t*	trx);	/*!< in: trx object */
 
-/** @return a trx_t instance from trx_pools. */
+/** @return an allocated transaction */
 trx_t *trx_create();
 
-/**
-  Release a trx_t instance back to the pool.
-  @param trx the instance to release.
-*/
-void trx_free(trx_t*& trx);
-
 /** At shutdown, frees a transaction object. */
-void
-trx_free_at_shutdown(trx_t *trx);
+void trx_free_at_shutdown(trx_t *trx);
 
 /** Disconnect a prepared transaction from MySQL.
 @param[in,out]	trx	transaction */
-void
-trx_disconnect_prepared(trx_t*	trx);
+void trx_disconnect_prepared(trx_t *trx);
 
 /** Initialize (resurrect) transactions at startup. */
-void
-trx_lists_init_at_db_start();
+void trx_lists_init_at_db_start();
 
 /*************************************************************//**
 Starts the transaction if it is not yet started. */
@@ -796,7 +787,7 @@ public:
 	rw_trx_hash.
 
 	Transitions to COMMITTED are protected by trx_t::mutex. */
-	trx_state_t	state;
+  Atomic_relaxed<trx_state_t> state;
 #ifdef WITH_WSREP
 	/** whether wsrep_on(mysql_thd) held at the start of transaction */
 	bool		wsrep;
@@ -840,7 +831,8 @@ public:
 					the coordinator using the XA API, and
 					is set to false  after commit or
 					rollback. */
-	unsigned	active_commit_ordered:1;/* 1 if owns prepare mutex */
+	/** whether this is holding the prepare mutex */
+	bool		active_commit_ordered;
 	/*------------------------------*/
 	bool		check_unique_secondary;
 					/*!< normally TRUE, but if the user
@@ -864,17 +856,6 @@ public:
 	ulint		duplicates;	/*!< TRX_DUP_IGNORE | TRX_DUP_REPLACE */
 	trx_dict_op_t	dict_operation;	/**< @see enum trx_dict_op_t */
 
-	/* Fields protected by the srv_conc_mutex. */
-	bool		declared_to_be_inside_innodb;
-					/*!< this is TRUE if we have declared
-					this transaction in
-					srv_conc_enter_innodb to be inside the
-					InnoDB engine */
-	ib_uint32_t	n_tickets_to_enter_innodb;
-					/*!< this can be > 0 only when
-					declared_to_... is TRUE; when we come
-					to srv_conc_innodb_enter, if the value
-					here is > 0, we decrement this by 1 */
 	ib_uint32_t	dict_operation_lock_mode;
 					/*!< 0, RW_S_LATCH, or RW_X_LATCH:
 					the latch mode trx currently holds
@@ -1004,24 +985,6 @@ public:
 	/*------------------------------*/
 	char*		detailed_error;	/*!< detailed error message for last
 					error, or empty. */
-	/* Lock wait statistics */
-	ulint		n_rec_lock_waits;
-					/*!< Number of record lock waits,
-					might not be exactly correct. */
-	ulint		n_table_lock_waits;
-					/*!< Number of table lock waits,
-					might not be exactly correct. */
-	ulint		total_rec_lock_wait_time;
-					/*!< Total rec lock wait time up
-					to this moment. */
-	ulint		total_table_lock_wait_time;
-					/*!< Total table lock wait time
-					up to this moment. */
-
-#ifdef WITH_WSREP
-	os_event_t	wsrep_event;	/* event waited for in srv_conc_slot */
-#endif /* WITH_WSREP */
-
 	rw_trx_hash_element_t *rw_trx_hash_element;
 	LF_PINS *rw_trx_hash_pins;
 	ulint		magic_n;
@@ -1109,6 +1072,9 @@ public:
     n_ref--;
     ut_ad(old_n_ref > 0);
   }
+
+  /** Free the memory to trx_pools */
+  void free();
 
 
   void assert_freed() const

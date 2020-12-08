@@ -189,7 +189,13 @@ bool sysvartrack_validate_value(THD *thd, const char *str, size_t len)
   char *token, *lasts= NULL;
   size_t rest= var_list.length;
 
-  if (!var_list.str || var_list.length == 0 ||
+  if (!var_list.str)
+  {
+    my_error(ER_WRONG_VALUE_FOR_VAR, MYF(0),
+             "session_track_system_variables", "NULL");
+    return false;
+  }
+  if (var_list.length == 0 ||
       !strcmp(var_list.str, "*"))
   {
     return false;
@@ -439,8 +445,11 @@ bool Session_sysvars_tracker::vars_list::store(THD *thd, String *buf)
     show.name= svar->name.str;
     show.value= (char *) svar;
 
+    mysql_mutex_lock(&LOCK_global_system_variables);
     const char *value= get_one_variable(thd, &show, OPT_SESSION, SHOW_SYS, NULL,
                                         &charset, val_buf, &val_length);
+    mysql_mutex_unlock(&LOCK_global_system_variables);
+
     if (is_plugin)
       mysql_mutex_unlock(&LOCK_plugin);
 

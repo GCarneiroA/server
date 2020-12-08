@@ -10,6 +10,10 @@
 #include <sys/syscall.h>
 #endif
 
+#ifdef HAVE_PTHREAD_GETTHREADID_NP
+#include <pthread_np.h>
+#endif
+
 typedef pthread_key_t thread_local_key_t;
 typedef pthread_t my_thread_handle;
 typedef pthread_attr_t my_thread_attr_t;
@@ -63,6 +67,10 @@ static inline my_thread_os_id_t my_thread_os_id()
   /* FreeBSD 10.2 */
   return pthread_getthreadid_np();
 #else
+#ifdef HAVE_GETTHRID
+  /* OpenBSD */
+  return getthrid();
+#else
 #ifdef HAVE_INTEGER_PTHREAD_SELF
   /* Unknown platform, fallback. */
   return pthread_self();
@@ -70,6 +78,7 @@ static inline my_thread_os_id_t my_thread_os_id()
   /* Feature not available. */
   return 0;
 #endif /* HAVE_INTEGER_PTHREAD_SELF */
+#endif /* HAVE_GETTHRID */
 #endif /* HAVE_PTHREAD_GETTHREADID_NP */
 #endif /* _WIN32 */
 #endif /* HAVE_SYS_GETTID */

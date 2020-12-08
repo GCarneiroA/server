@@ -1884,13 +1884,10 @@ extern "C" void unireg_abort(int exit_code)
     WSREP_INFO("Some threads may fail to exit.");
   }
 
-  if (WSREP_ON)
+  if (WSREP_ON && wsrep_inited)
   {
-    /* In bootstrap mode we deinitialize wsrep here. */
-    if (opt_bootstrap || wsrep_recovery)
-    {
-      if (wsrep_inited) wsrep_deinit(true);
-    }
+    wsrep_deinit(true);
+    wsrep_deinit_server();
   }
 #endif // WITH_WSREP
 
@@ -2526,6 +2523,11 @@ static void network_init(void)
 #endif
   }
 #endif
+
+#ifdef _WIN32
+  network_init_win();
+#endif
+
   DBUG_PRINT("info",("server started"));
   DBUG_VOID_RETURN;
 }
@@ -2548,7 +2550,7 @@ void close_connection(THD *thd, uint sql_errno)
 
   if (sql_errno)
   {
-    net_send_error(thd, sql_errno, ER_DEFAULT(sql_errno), NULL);
+    thd->protocol->net_send_error(thd, sql_errno, ER_DEFAULT(sql_errno), NULL);
     thd->print_aborted_warning(lvl, ER_DEFAULT(sql_errno));
   }
   else
@@ -2868,7 +2870,6 @@ void init_signals(void)
     sigemptyset(&sa.sa_mask);
     sigprocmask(SIG_SETMASK,&sa.sa_mask,NULL);
 
-    my_init_stacktrace(0);
 #if defined(__amiga__)
     sa.sa_handler=(void(*)())handle_fatal_signal;
 #else
@@ -3599,7 +3600,8 @@ static const char *rpl_make_log_name(PSI_memory_key key, const char *opt,
                                      const char *def, const char *ext)
 {
   DBUG_ENTER("rpl_make_log_name");
-  DBUG_PRINT("enter", ("opt: %s, def: %s, ext: %s", opt, def, ext));
+  DBUG_PRINT("enter", ("opt: %s, def: %s, ext: %s", opt ? opt : "(null)",
+                       def, ext));
   char buff[FN_REFLEN];
   const char *base= opt ? opt : def;
   unsigned int options=
@@ -4143,8 +4145,10 @@ static int init_common_variables()
     get corrupted if accesses with names of different case.
   */
   DBUG_PRINT("info", ("lower_case_table_names: %d", lower_case_table_names));
+  if(mysql_real_data_home_ptr == NULL || *mysql_real_data_home_ptr == 0)
+    mysql_real_data_home_ptr= mysql_real_data_home;
   SYSVAR_AUTOSIZE(lower_case_file_system,
-                  test_if_case_insensitive(mysql_real_data_home));
+                  test_if_case_insensitive(mysql_real_data_home_ptr));
   if (!lower_case_table_names && lower_case_file_system == 1)
   {
     if (lower_case_table_names_used)
@@ -4161,7 +4165,7 @@ static int init_common_variables()
     {
       if (global_system_variables.log_warnings)
 	sql_print_warning("Setting lower_case_table_names=2 because file "
-                  "system for %s is case insensitive", mysql_real_data_home);
+                  "system for %s is case insensitive", mysql_real_data_home_ptr);
       SYSVAR_AUTOSIZE(lower_case_table_names, 2);
     }
   }
@@ -4172,7 +4176,7 @@ static int init_common_variables()
       sql_print_warning("lower_case_table_names was set to 2, even though your "
                         "the file system '%s' is case sensitive.  Now setting "
                         "lower_case_table_names to 0 to avoid future problems.",
-			mysql_real_data_home);
+			mysql_real_data_home_ptr);
     SYSVAR_AUTOSIZE(lower_case_table_names, 0);
   }
   else
@@ -5024,6 +5028,30 @@ static int init_server_components()
       /* The following options were added after 5.6.10 */
       MYSQL_TO_BE_IMPLEMENTED_OPTION("rpl-stop-slave-timeout"),
       MYSQL_TO_BE_IMPLEMENTED_OPTION("validate-user-plugins"), // NO_EMBEDDED_ACCESS_CHECKS
+
+      /* The following options were deprecated in 10.5 or earlier */
+      MARIADB_REMOVED_OPTION("innodb-adaptive-max-sleep-delay"),
+      MARIADB_REMOVED_OPTION("innodb-background-scrub-data-check-interval"),
+      MARIADB_REMOVED_OPTION("innodb-background-scrub-data-compressed"),
+      MARIADB_REMOVED_OPTION("innodb-background-scrub-data-interval"),
+      MARIADB_REMOVED_OPTION("innodb-background-scrub-data-uncompressed"),
+      MARIADB_REMOVED_OPTION("innodb-buffer-pool-instances"),
+      MARIADB_REMOVED_OPTION("innodb-commit-concurrency"),
+      MARIADB_REMOVED_OPTION("innodb-concurrency-tickets"),
+      MARIADB_REMOVED_OPTION("innodb-file-format"),
+      MARIADB_REMOVED_OPTION("innodb-large-prefix"),
+      MARIADB_REMOVED_OPTION("innodb-lock-schedule-algorithm"),
+      MARIADB_REMOVED_OPTION("innodb-log-checksums"),
+      MARIADB_REMOVED_OPTION("innodb-log-compressed-pages"),
+      MARIADB_REMOVED_OPTION("innodb-log-files-in-group"),
+      MARIADB_REMOVED_OPTION("innodb-log-optimize-ddl"),
+      MARIADB_REMOVED_OPTION("innodb-page-cleaners"),
+      MARIADB_REMOVED_OPTION("innodb-replication-delay"),
+      MARIADB_REMOVED_OPTION("innodb-scrub-log"),
+      MARIADB_REMOVED_OPTION("innodb-scrub-log-speed"),
+      MARIADB_REMOVED_OPTION("innodb-thread-concurrency"),
+      MARIADB_REMOVED_OPTION("innodb-thread-sleep-delay"),
+      MARIADB_REMOVED_OPTION("innodb-undo-logs"),
       {0, 0, 0, 0, 0, 0, GET_NO_ARG, NO_ARG, 0, 0, 0, 0, 0, 0}
     };
     /*
@@ -5512,13 +5540,6 @@ int mysqld_main(int argc, char **argv)
 
   init_ssl();
   network_init();
-
-#ifdef _WIN32
-  if (!opt_console)
-  {
-    FreeConsole();				// Remove window
-  }
-#endif
 
 #ifdef WITH_WSREP
   // Recover and exit.
@@ -6509,11 +6530,11 @@ struct my_option my_long_options[]=
   {"temp-pool", 0,
 #if (ENABLE_TEMP_POOL)
    "Using this option will cause most temporary files created to use a small "
-   "set of names, rather than a unique name for each new file.",
+   "set of names, rather than a unique name for each new file. Deprecated.",
 #else
    "This option is ignored on this OS.",
 #endif
-   &use_temp_pool, &use_temp_pool, 0, GET_BOOL, NO_ARG, 1,
+   &use_temp_pool, &use_temp_pool, 0, GET_BOOL, NO_ARG, 0,
    0, 0, 0, 0, 0},
   {"transaction-isolation", 0,
    "Default transaction isolation level",
@@ -6926,8 +6947,8 @@ show_ssl_get_server_not_after(THD *thd, SHOW_VAR *var, char *buff,
 
 #endif /* HAVE_OPENSSL && !EMBEDDED_LIBRARY */
 
-static int show_default_keycache(THD *thd, SHOW_VAR *var, char *buff,
-                                 enum enum_var_type scope)
+static int show_default_keycache(THD *thd, SHOW_VAR *var, void *buff,
+                                 system_status_var *, enum_var_type)
 {
   struct st_data {
     KEY_CACHE_STATISTICS stats;
@@ -6960,7 +6981,7 @@ static int show_default_keycache(THD *thd, SHOW_VAR *var, char *buff,
 
   v->name= 0;
 
-  DBUG_ASSERT((char*)(v+1) <= buff + SHOW_VAR_FUNC_BUFF_SIZE);
+  DBUG_ASSERT((char*)(v+1) <= static_cast<char*>(buff) + SHOW_VAR_FUNC_BUFF_SIZE);
 
 #undef set_one_keycache_var
 
@@ -6984,8 +7005,8 @@ static int show_memory_used(THD *thd, SHOW_VAR *var, char *buff,
 
 
 #ifndef DBUG_OFF
-static int debug_status_func(THD *thd, SHOW_VAR *var, char *buff,
-                             enum enum_var_type scope)
+static int debug_status_func(THD *thd, SHOW_VAR *var, void *buff,
+                             system_status_var *, enum_var_type)
 {
 #define add_var(X,Y,Z)                  \
   v->name= X;                           \
@@ -7148,6 +7169,7 @@ SHOW_VAR status_vars[]= {
   {"Max_used_connections",     (char*) &max_used_connections,  SHOW_LONG},
   {"Memory_used",              (char*) &show_memory_used, SHOW_SIMPLE_FUNC},
   {"Memory_used_initial",      (char*) &start_memory_used, SHOW_LONGLONG},
+  {"Resultset_metadata_skipped", (char *) offsetof(STATUS_VAR, skip_metadata_count),SHOW_LONG_STATUS},
   {"Not_flushed_delayed_rows", (char*) &delayed_rows_in_use,    SHOW_LONG_NOFLUSH},
   {"Open_files",               (char*) &my_file_opened,         SHOW_SINT},
   {"Open_streams",             (char*) &my_stream_opened,       SHOW_LONG_NOFLUSH},

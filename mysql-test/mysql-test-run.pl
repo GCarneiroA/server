@@ -179,6 +179,7 @@ my @DEFAULT_SUITES= qw(
     csv-
     compat/oracle-
     compat/mssql-
+    compat/maxdb-
     encryption-
     federated-
     funcs_1-
@@ -320,6 +321,7 @@ my $opt_start_timeout   = $ENV{MTR_START_TIMEOUT}    || 180; # seconds
 sub suite_timeout { return $opt_suite_timeout * 60; };
 
 my $opt_wait_all;
+my $opt_wait_for_pos_timeout;
 my $opt_user_args;
 my $opt_repeat= 1;
 my $opt_retry= 1;
@@ -645,6 +647,7 @@ sub run_test_server ($$$) {
 	  # Client disconnected
 	  mtr_verbose("Child closed socket");
 	  $s->remove($sock);
+	  $sock->close;
 	  if (--$childs == 0){
 	    return ("Completed", $test_failure, $completed, $extra_warnings);
 	  }
@@ -691,8 +694,7 @@ sub run_test_server ($$$) {
                   My::CoreDump->show($core_file, $exe_mysqld, $opt_parallel);
 
                   # Limit number of core files saved
-                  if ($opt_max_save_core > 0 &&
-                      $num_saved_cores >= $opt_max_save_core)
+                  if ($num_saved_cores >= $opt_max_save_core)
                   {
                     mtr_report(" - deleting it, already saved",
                                "$opt_max_save_core");
@@ -708,8 +710,7 @@ sub run_test_server ($$$) {
             },
             $worker_savedir);
 
-	    if ($opt_max_save_datadir > 0 &&
-		$num_saved_datadir >= $opt_max_save_datadir)
+	    if ($num_saved_datadir >= $opt_max_save_datadir)
 	    {
 	      mtr_report(" - skipping '$worker_savedir/'");
 	      rmtree($worker_savedir);
@@ -718,9 +719,9 @@ sub run_test_server ($$$) {
             {
 	      mtr_report(" - saving '$worker_savedir/' to '$savedir/'");
 	      rename($worker_savedir, $savedir);
+	      $num_saved_datadir++;
 	    }
 	    resfile_print_test();
-	    $num_saved_datadir++;
 	    $num_failed_test++ unless ($result->{retries} ||
                                        $result->{exp_fail});
 
@@ -816,6 +817,7 @@ sub run_test_server ($$$) {
             # Test failure due to warnings, force is off
             return ("Warnings in log", 1, $completed, $extra_warnings);
           }
+          next;
         }
 	elsif ($line =~ /^SPENT/) {
 	  add_total_times($line);
@@ -1230,6 +1232,7 @@ sub command_line_setup {
              'verbose+'                 => \$opt_verbose,
              'verbose-restart'          => \&report_option,
              'sleep=i'                  => \$opt_sleep,
+             'wait-for-pos-timeout=i'   => \$opt_wait_for_pos_timeout,
              'start-dirty'              => \$opt_start_dirty,
              'start-and-exit'           => \$opt_start_exit,
              'start'                    => \$opt_start,
@@ -1275,6 +1278,17 @@ sub command_line_setup {
   # --------------------------------------------------------------------------
   if ($opt_verbose != 0){
     report_option('verbose', $opt_verbose);
+  }
+
+  # Negative values aren't meaningful on integer options
+  foreach(grep(/=i$/, keys %options))
+  {
+    if (defined ${$options{$_}} &&
+        do { no warnings "numeric"; int ${$options{$_}} < 0})
+    {
+      my $v= (split /=/)[0];
+      die("$v doesn't accept a negative value:");
+    }
   }
 
   # Find the absolute path to the test directory
@@ -1667,6 +1681,16 @@ sub command_line_setup {
     $opt_shutdown_timeout= 24 * 60;
     # One day for PID file creation (this is given in seconds not minutes)
     $opt_start_timeout= 24 * 60 * 60;
+    if ($opt_rr && open(my $fh, '<', '/proc/sys/kernel/perf_event_paranoid'))
+    {
+      my $perf_event_paranoid= <$fh>;
+      close $fh;
+      chomp $perf_event_paranoid;
+      if ($perf_event_paranoid == 0)
+      {
+        mtr_error("rr requires kernel.perf_event_paranoid set to 1");
+      }
+    }
   }
   mtr_verbose("ASAN_OPTIONS=$ENV{ASAN_OPTIONS}");
 
@@ -2346,7 +2370,8 @@ sub environment_setup {
   $ENV{'MARIADB_CONV'}=             $exe_mariadb_conv;
   if(IS_WINDOWS)
   {
-     $ENV{'MYSQL_INSTALL_DB_EXE'}=  mtr_exe_exists("$bindir/sql$opt_vs_config/mysql_install_db");
+     $ENV{'MYSQL_INSTALL_DB_EXE'}=  mtr_exe_exists("$bindir/sql$opt_vs_config/mysql_install_db",
+       "$bindir/bin/mysql_install_db");
   }
 
   my $client_config_exe=
@@ -4079,6 +4104,7 @@ sub run_testcase ($$) {
     if (start_servers($tinfo))
     {
       report_failure_and_restart($tinfo);
+      unlink $path_current_testlog;
       return 1;
     }
   }
@@ -5813,11 +5839,15 @@ sub start_mysqltest ($) {
     mtr_add_arg($args, "--sleep=%d", $opt_sleep);
   }
 
-  if ( $opt_valgrind )
+  if ( $opt_valgrind || $opt_wait_for_pos_timeout)
   {
-    # We are running server under valgrind, which causes some replication
-    # test to be much slower, notable rpl_mdev6020.  Increase timeout.
-    mtr_add_arg($args, "--wait-for-pos-timeout=1500");
+    if (! $opt_wait_for_pos_timeout)
+    {
+      # We are running server under valgrind, which causes some replication
+      # test to be much slower, notable rpl_mdev6020.  Increase timeout.
+      $opt_wait_for_pos_timeout= 1500;
+    }
+    mtr_add_arg($args, "--wait-for-pos-timeout=$opt_wait_for_pos_timeout");
   }
 
   if ( $opt_ssl )
@@ -6445,7 +6475,7 @@ Options for debugging the product
   debug-server          Use debug version of server, but without turning on
                         tracing
   debugger=NAME         Start mysqld in the selected debugger
-  gdb                   Start the mysqld(s) in gdb
+  gdb[=gdb_arguments]   Start the mariadbd(s) in gdb
   manual-debug          Let user manually start mysqld in debugger, before
                         running test(s)
   manual-gdb            Let user manually start mysqld in gdb, before running
@@ -6458,12 +6488,12 @@ Options for debugging the product
                         test(s)
   max-save-core         Limit the number of core files saved (to avoid filling
                         up disks for heavily crashing server). Defaults to
-                        $opt_max_save_core, set to 0 for no limit. Set
-                        it's default with MTR_MAX_SAVE_CORE
+                        $opt_max_save_core. Set its default with
+                        MTR_MAX_SAVE_CORE
   max-save-datadir      Limit the number of datadir saved (to avoid filling
                         up disks for heavily crashing server). Defaults to
-                        $opt_max_save_datadir, set to 0 for no limit. Set
-                        it's default with MTR_MAX_SAVE_DATADIR
+                        $opt_max_save_datadir. Set its default with
+                        MTR_MAX_SAVE_DATADIR
   max-test-fail         Limit the number of test failures before aborting
                         the current test run. Defaults to
                         $opt_max_test_fail, set to 0 for no limit. Set
@@ -6552,6 +6582,7 @@ Misc options
                         the file (for buildbot)
 
   sleep=SECONDS         Passed to mysqltest, will be used as fixed sleep time
+  wait-for-pos-timeout=NUM  Passed to mysqltest
   debug-sync-timeout=NUM Set default timeout for WAIT_FOR debug sync
                         actions. Disable facility with NUM=0.
   gcov                  Collect coverage information after the test.

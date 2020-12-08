@@ -738,7 +738,7 @@ Table	Create Table
 t2	CREATE TABLE `t2` (
   `C2` int(11) DEFAULT NULL,
   KEY `c2` (`C2`),
-  CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`c2`) REFERENCES `t1` (`c1`)
+  CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`C2`) REFERENCES `t1` (`C1`)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1
 ALTER TABLE t1 CHANGE COLUMN C1 c5 INT;
 ALTER TABLE t2 CHANGE COLUMN C2 c6 INT;
@@ -785,7 +785,7 @@ SELECT C.NAME FROM INFORMATION_SCHEMA.INNODB_SYS_COLUMNS C INNER JOIN
 INFORMATION_SCHEMA.INNODB_SYS_TABLES T ON C.TABLE_ID=T.TABLE_ID
 WHERE T.NAME='test/t1';
 NAME
-a
+A
 b
 DROP TABLE t1;
 # different FOREIGN KEY cases
@@ -842,27 +842,27 @@ t2	CREATE TABLE `t2` (
   KEY `bb` (`BB`),
   KEY `CC` (`CC`),
   KEY `DD` (`DD`),
-  CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`),
-  CONSTRAINT `t2_ibfk_2` FOREIGN KEY (`bb`) REFERENCES `t1` (`b`),
-  CONSTRAINT `t2_ibfk_3` FOREIGN KEY (`cc`) REFERENCES `t1` (`c`),
-  CONSTRAINT `t2_ibfk_4` FOREIGN KEY (`dd`) REFERENCES `t1` (`d`)
+  CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`),
+  CONSTRAINT `t2_ibfk_2` FOREIGN KEY (`BB`) REFERENCES `t1` (`B`),
+  CONSTRAINT `t2_ibfk_3` FOREIGN KEY (`CC`) REFERENCES `t1` (`C`),
+  CONSTRAINT `t2_ibfk_4` FOREIGN KEY (`DD`) REFERENCES `t1` (`D`)
 ) ENGINE=InnoDB DEFAULT CHARSET=latin1
 DELETE FROM t1 WHERE a=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE A=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE b=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE B=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE c=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE C=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE d=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DELETE FROM t1 WHERE D=1;
-ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`aa`) REFERENCES `t1` (`a`))
+ERROR 23000: Cannot delete or update a parent row: a foreign key constraint fails (`test`.`t2`, CONSTRAINT `t2_ibfk_1` FOREIGN KEY (`AA`) REFERENCES `t1` (`A`))
 DROP TABLE t2, t1;
 # virtual columns case too
 CREATE TABLE t1 (a INT, b INT GENERATED ALWAYS AS (a) VIRTUAL) ENGINE = InnoDB;
@@ -877,7 +877,7 @@ SELECT C.NAME FROM INFORMATION_SCHEMA.INNODB_SYS_COLUMNS C INNER JOIN
 INFORMATION_SCHEMA.INNODB_SYS_TABLES T ON C.TABLE_ID=T.TABLE_ID
 WHERE T.NAME='test/t1';
 NAME
-a
+A
 b
 DROP TABLE t1;
 # and an MDEV-18041 regression related to indexes prefixes
@@ -1068,4 +1068,21 @@ info: Records: 0  Duplicates: 0  Warnings: 0
 SELECT * FROM t1;
 a	b
 10	10:20:30
+DROP TABLE t1;
+#
+# MDEV-18042 Server crashes in mysql_alter_table upon adding a non-null
+# date column under NO_ZERO_DATE with ALGORITHM=INPLACE
+#
+SET @OLD_SQL_MODE= @@SQL_MODE;
+SET @@SQL_MODE= 'NO_ZERO_DATE';
+CREATE OR REPLACE TABLE t1 (i INT) ENGINE=MyISAM;
+ALTER TABLE t1 ADD COLUMN d DATE NOT NULL, ALGORITHM=INPLACE;
+ERROR 0A000: ALGORITHM=INPLACE is not supported for this operation. Try ALGORITHM=COPY
+CREATE OR REPLACE TABLE t1 (i INT) ENGINE=InnoDB;
+ALTER TABLE t1 ADD d DATETIME NOT NULL CHECK (f <= 0), ALGORITHM=COPY;
+ERROR 42S22: Unknown column 'f' in 'CHECK'
+CREATE OR REPLACE TABLE t1 (a int) ENGINE=InnoDB;
+ALTER TABLE t1 ADD COLUMN b DATETIME NOT NULL, LOCK=NONE;
+# Cleanup
+SET @@SQL_MODE= @OLD_SQL_MODE;
 DROP TABLE t1;

@@ -92,7 +92,6 @@ public:
   bool auto_inc_initialized;
   mysql_mutex_t auto_inc_mutex;                /**< protecting auto_inc val */
   ulonglong next_auto_inc_val;                 /**< first non reserved value */
-  ulonglong prev_auto_inc_val;                 /**< stored next_auto_inc_val */
   /**
     Hash of partition names. Initialized in the first ha_partition::open()
     for the table_share. After that it is read-only, i.e. no locking required.
@@ -104,7 +103,6 @@ public:
   Partition_share()
     : auto_inc_initialized(false),
     next_auto_inc_val(0),
-    prev_auto_inc_val(0),
     partition_name_hash_initialized(false),
     partition_names(NULL)
   {
@@ -429,24 +427,6 @@ private:
   MY_BITMAP m_locked_partitions;
   /** Stores shared auto_increment etc. */
   Partition_share *part_share;
-  /** Fix spurious -Werror=overloaded-virtual in GCC 9 */
-  virtual void restore_auto_increment(ulonglong prev_insert_id) override
-  {
-    handler::restore_auto_increment(prev_insert_id);
-  }
-  /** Store and restore next_auto_inc_val over duplicate key errors. */
-  void store_auto_increment() override
-  {
-    DBUG_ASSERT(part_share);
-    part_share->prev_auto_inc_val= part_share->next_auto_inc_val;
-    handler::store_auto_increment();
-  }
-  void restore_auto_increment() override
-  {
-    DBUG_ASSERT(part_share);
-    part_share->next_auto_inc_val= part_share->prev_auto_inc_val;
-    handler::restore_auto_increment();
-  }
   void sum_copy_info(handler *file);
   void sum_copy_infos();
   void reset_copy_info() override;
@@ -515,7 +495,7 @@ public:
     -------------------------------------------------------------------------
     MODULE create/delete handler object
     -------------------------------------------------------------------------
-    Object create/delete methode. The normal called when a table object
+    Object create/delete method. Normally called when a table object
     exists. There is also a method to create the handler object with only
     partition information. This is used from mysql_create_table when the
     table is to be created and the engine type is deduced to be the
@@ -832,7 +812,7 @@ public:
 
   /**
     @breif
-    Positions an index cursor to the index specified in the hanlde. Fetches the
+    Positions an index cursor to the index specified in the handle. Fetches the
     row if available. If the key value is null, begin at first key of the
     index.
   */
@@ -1132,7 +1112,7 @@ public:
 
     HA_REC_NOT_IN_SEQ:
     This flag is set for handlers that cannot guarantee that the rows are
-    returned accroding to incremental positions (0, 1, 2, 3...).
+    returned according to incremental positions (0, 1, 2, 3...).
     This also means that rnd_next() should return HA_ERR_RECORD_DELETED
     if it finds a deleted row.
     (MyISAM (not fixed length row), HEAP, InnoDB)
@@ -1619,9 +1599,8 @@ public:
     return h;
   }
 
-  ha_rows part_records(void *_part_elem)
+  ha_rows part_records(partition_element *part_elem)
   {
-    partition_element *part_elem= reinterpret_cast<partition_element *>(_part_elem);
     DBUG_ASSERT(m_part_info);
     uint32 sub_factor= m_part_info->num_subparts ? m_part_info->num_subparts : 1;
     uint32 part_id= part_elem->id * sub_factor;

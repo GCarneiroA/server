@@ -290,7 +290,9 @@ int Wsrep_high_priority_service::append_fragment_and_commit(
 
   ret= ret || trans_commit(m_thd);
   ret= ret || (m_thd->wsrep_cs().after_applying(), 0);
-  m_thd->mdl_context.release_transactional_locks();
+  m_thd->release_transactional_locks();
+
+  free_root(m_thd->mem_root, MYF(MY_KEEP_PREALLOC));
 
   thd_proc_info(m_thd, "wsrep applier committed");
 
@@ -315,16 +317,22 @@ int Wsrep_high_priority_service::commit(const wsrep::ws_handle& ws_handle,
   DBUG_ASSERT(thd->wsrep_trx().active());
   thd->wsrep_cs().prepare_for_ordering(ws_handle, ws_meta, true);
   thd_proc_info(thd, "committing");
+  int ret=0;
 
   const bool is_ordered= !ws_meta.seqno().is_undefined();
-  int ret= trans_commit(thd);
+
+  if (!thd->transaction->stmt.is_empty())
+    ret= trans_commit_stmt(thd);
+
+  if (ret == 0)
+    ret= trans_commit(thd);
 
   if (ret == 0)
   {
     m_rgi->cleanup_context(thd, 0);
   }
 
-  m_thd->mdl_context.release_transactional_locks();
+  m_thd->release_transactional_locks();
 
   thd_proc_info(thd, "wsrep applier committed");
 
@@ -350,6 +358,8 @@ int Wsrep_high_priority_service::commit(const wsrep::ws_handle& ws_handle,
 
   thd->lex->sql_command= SQLCOM_END;
 
+  free_root(thd->mem_root, MYF(MY_KEEP_PREALLOC));
+
   must_exit_= check_exit_status();
   DBUG_RETURN(ret);
 }
@@ -368,8 +378,11 @@ int Wsrep_high_priority_service::rollback(const wsrep::ws_handle& ws_handle,
      assert(ws_handle == wsrep::ws_handle());
   }
   int ret= (trans_rollback_stmt(m_thd) || trans_rollback(m_thd));
-  m_thd->mdl_context.release_transactional_locks();
+  m_thd->release_transactional_locks();
   m_thd->mdl_context.release_explicit_locks();
+
+  free_root(m_thd->mem_root, MYF(MY_KEEP_PREALLOC));
+
   DBUG_RETURN(ret);
 }
 

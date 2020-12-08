@@ -31,6 +31,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "data0data.h"
 #include "dict0mem.h"
 #include "fsp0fsp.h"
+#include "srw_lock.h"
 #include <deque>
 
 class MDL_ticket;
@@ -336,7 +337,6 @@ UNIV_INLINE
 void
 dict_table_autoinc_initialize(dict_table_t* table, ib_uint64_t value)
 {
-	ut_ad(mutex_own(&table->autoinc_mutex));
 	table->autoinc = value;
 }
 
@@ -349,7 +349,6 @@ UNIV_INLINE
 ib_uint64_t
 dict_table_autoinc_read(const dict_table_t* table)
 {
-	ut_ad(mutex_own(&table->autoinc_mutex));
 	return(table->autoinc);
 }
 
@@ -363,8 +362,6 @@ UNIV_INLINE
 bool
 dict_table_autoinc_update_if_greater(dict_table_t* table, ib_uint64_t value)
 {
-	ut_ad(mutex_own(&table->autoinc_mutex));
-
 	if (value > table->autoinc) {
 
 		table->autoinc = value;
@@ -914,19 +911,6 @@ inline ulint dict_tf_get_zip_size(ulint flags)
 		: 0;
 }
 
-/** Determine the extent size (in pages) for the given table
-@param[in]	table	the table whose extent size is being
-			calculated.
-@return extent size in pages (256, 128 or 64) */
-inline ulint dict_table_extent_size(const dict_table_t* table)
-{
-	if (ulint zip_size = table->space->zip_size()) {
-		return (1U << 20) / zip_size;
-	}
-
-	return FSP_EXTENT_SIZE;
-}
-
 /********************************************************************//**
 Checks if a column is in the ordering columns of the clustered index of a
 table. Column prefixes are treated like whole columns.
@@ -1277,15 +1261,6 @@ dict_index_get_page(
 /*================*/
 	const dict_index_t*	tree)	/*!< in: index */
 	MY_ATTRIBUTE((nonnull, warn_unused_result));
-/*********************************************************************//**
-Gets the read-write lock of the index tree.
-@return read-write lock */
-UNIV_INLINE
-rw_lock_t*
-dict_index_get_lock(
-/*================*/
-	dict_index_t*	index)	/*!< in: index */
-	MY_ATTRIBUTE((nonnull, warn_unused_result));
 /********************************************************************//**
 Returns free space reserved for future updates of records. This is
 relevant only in the case of many consecutive inserts, as updates
@@ -1409,6 +1384,21 @@ extern ib_mutex_t	dict_foreign_err_mutex; /* mutex protecting the
 /** InnoDB data dictionary cache */
 class dict_sys_t
 {
+private:
+  /** @brief the data dictionary rw-latch protecting dict_sys
+
+  Table create, drop, etc. reserve this in X-mode (along with
+  acquiring dict_sys.mutex); implicit or
+  backround operations that are not fully covered by MDL
+  (rollback, foreign key checks) reserve this in S-mode.
+
+  This latch also prevents lock waits when accessing the InnoDB
+  data dictionary tables. @see trx_t::dict_operation_lock_mode */
+  MY_ALIGNED(CACHE_LINE_SIZE) srw_lock latch;
+#ifdef UNIV_DEBUG
+  /** whether latch is being held in exclusive mode (by any thread) */
+  bool latch_ex;
+#endif
 public:
 	DictSysMutex	mutex;		/*!< mutex protecting the data
 					dictionary; protects also the
@@ -1417,21 +1407,6 @@ public:
 					and DROP TABLE, as well as reading
 					the dictionary data for a table from
 					system tables */
-	/** @brief the data dictionary rw-latch protecting dict_sys
-
-	Table create, drop, etc. reserve this in X-mode; implicit or
-	backround operations purge, rollback, foreign key checks reserve this
-	in S-mode; not all internal InnoDB operations are covered by MDL.
-
-	This latch also prevents lock waits when accessing the InnoDB
-	data dictionary tables. @see trx_t::dict_operation_lock_mode */
-	rw_lock_t	latch;
-	row_id_t	row_id;		/*!< the next row id to assign;
-					NOTE that at a checkpoint this
-					must be written to the dict system
-					header and flushed to a file; in
-					recovery this must be derived from
-					the log records */
 	hash_table_t	table_hash;	/*!< hash table of the tables, based
 					on name */
 	/** hash table of persistent table IDs */
@@ -1449,13 +1424,31 @@ public:
 	UT_LIST_BASE_NODE_T(dict_table_t)
 			table_non_LRU;	/*!< List of tables that can't be
 					evicted from the cache */
+
 private:
-	bool m_initialised;
-	/** the sequence of temporary table IDs */
-	std::atomic<table_id_t> temp_table_id;
-	/** hash table of temporary table IDs */
-	hash_table_t temp_id_hash;
+  bool m_initialised= false;
+  /** the sequence of temporary table IDs */
+  std::atomic<table_id_t> temp_table_id{DICT_HDR_FIRST_ID};
+  /** hash table of temporary table IDs */
+  hash_table_t temp_id_hash;
+  /** the next value of DB_ROW_ID, backed by DICT_HDR_ROW_ID
+  (FIXME: remove this, and move to dict_table_t) */
+  Atomic_relaxed<row_id_t> row_id;
+  /** The synchronization interval of row_id */
+  static constexpr size_t ROW_ID_WRITE_MARGIN= 256;
 public:
+  /** @return A new value for GEN_CLUST_INDEX(DB_ROW_ID) */
+  inline row_id_t get_new_row_id();
+
+  /** Ensure that row_id is not smaller than id, on IMPORT TABLESPACE */
+  inline void update_row_id(row_id_t id);
+
+  /** Recover the global DB_ROW_ID sequence on database startup */
+  void recover_row_id(row_id_t id)
+  {
+    row_id= ut_uint64_align_up(id, ROW_ID_WRITE_MARGIN) + ROW_ID_WRITE_MARGIN;
+  }
+
 	/** @return a new temporary table ID */
 	table_id_t get_temporary_table_id() {
 		return temp_table_id.fetch_add(1, std::memory_order_relaxed);
@@ -1496,12 +1489,6 @@ public:
 		DBUG_ASSERT(!table || !table->is_temporary());
 		return table;
 	}
-
-  /**
-    Constructor.  Further initialisation happens in create().
-  */
-
-  dict_sys_t() : m_initialised(false), temp_table_id(DICT_HDR_FIRST_ID) {}
 
   bool is_initialised() const { return m_initialised; }
 
@@ -1561,25 +1548,30 @@ public:
 
 #ifdef UNIV_DEBUG
   /** Assert that the data dictionary is locked */
-  void assert_locked()
-  {
-    ut_ad(mutex_own(&mutex));
-    ut_ad(rw_lock_own(&latch, RW_LOCK_X));
-  }
+  void assert_locked() { ut_ad(mutex_own(&mutex)); }
 #endif
   /** Lock the data dictionary cache. */
   void lock(const char* file, unsigned line)
   {
-    rw_lock_x_lock_func(&latch, 0, file, line);
+    latch.wr_lock(SRW_LOCK_ARGS(file, line));
+    ut_ad(!latch_ex);
+    ut_d(latch_ex= true);
     mutex_enter_loc(&mutex, file, line);
   }
 
   /** Unlock the data dictionary cache. */
   void unlock()
   {
+    ut_ad(latch_ex);
+    ut_d(latch_ex= false);
     mutex_exit(&mutex);
-    rw_lock_x_unlock(&latch);
+    latch.wr_unlock();
   }
+
+  /** Prevent modifications of the data dictionary */
+  void freeze() { latch.rd_lock(SRW_LOCK_CALL); ut_ad(!latch_ex); }
+  /** Allow modifications of the data dictionary */
+  void unfreeze() { ut_ad(!latch_ex); latch.rd_unlock(); }
 
   /** Estimate the used memory occupied by the data dictionary
   table and index objects.
@@ -1806,20 +1798,6 @@ dict_table_decode_n_col(
 	ulint	encoded,
 	ulint*	n_col,
 	ulint*	n_v_col);
-
-/** Look for any dictionary objects that are found in the given tablespace.
-@param[in]	space_id	Tablespace ID to search for.
-@return true if tablespace is empty. */
-bool
-dict_space_is_empty(
-	ulint	space_id);
-
-/** Find the space_id for the given name in sys_tablespaces.
-@param[in]	name	Tablespace name to search for.
-@return the tablespace ID. */
-ulint
-dict_space_get_id(
-	const char*	name);
 
 /** Free the virtual column template
 @param[in,out]	vc_templ	virtual column template */

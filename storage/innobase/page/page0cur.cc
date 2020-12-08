@@ -1053,6 +1053,15 @@ static byte* page_mem_alloc_heap(buf_block_t *block, ulint need,
   byte *n_heap= my_assume_aligned<2>(PAGE_N_HEAP + PAGE_HEADER + block->frame);
 
   const uint16_t h= mach_read_from_2(n_heap);
+  if (UNIV_UNLIKELY((h + 1) & 0x6000))
+  {
+    /* At the minimum record size of 5+2 bytes, we can only reach this
+    condition when using innodb_page_size=64k. */
+    ut_ad((h & 0x7fff) == 8191);
+    ut_ad(srv_page_size == 65536);
+    return NULL;
+  }
+
   *heap_no= h & 0x7fff;
   ut_ad(*heap_no < srv_page_size / REC_N_NEW_EXTRA_BYTES);
   compile_time_assert(UNIV_PAGE_SIZE_MAX / REC_N_NEW_EXTRA_BYTES < 0x3fff);
@@ -1493,7 +1502,10 @@ inc_dir:
     rec_set_bit_field_1(next_rec, n_owned + 1, REC_NEW_N_OWNED,
                         REC_N_OWNED_MASK, REC_N_OWNED_SHIFT);
     if (mtr->get_log_mode() != MTR_LOG_ALL)
+    {
+      mtr->set_modified(*block);
       goto copied;
+    }
 
     const byte * const c_start= cur->rec - extra_size;
     if (extra_size > REC_N_NEW_EXTRA_BYTES &&
@@ -1532,7 +1544,10 @@ inc_dir:
     rec_set_bit_field_1(next_rec, n_owned + 1, REC_OLD_N_OWNED,
                         REC_N_OWNED_MASK, REC_N_OWNED_SHIFT);
     if (mtr->get_log_mode() != MTR_LOG_ALL)
+    {
+      mtr->set_modified(*block);
       goto copied;
+    }
 
     ut_ad(extra_size > REC_N_OLD_EXTRA_BYTES);
     const byte * const c_start= cur->rec - extra_size;
@@ -2668,7 +2683,7 @@ corrupted:
   data_len-= enc_hdr_l >> 3;
   data= &static_cast<const byte*>(data)[enc_hdr_l >> 3];
 
-  memcpy(buf, &prev_rec[-REC_N_NEW_EXTRA_BYTES - hdr_c], hdr_c);
+  memcpy(buf, prev_rec - REC_N_NEW_EXTRA_BYTES - hdr_c, hdr_c);
   buf+= hdr_c;
   *buf++= static_cast<byte>((enc_hdr_l & 3) << 4); /* info_bits; n_owned=0 */
   *buf++= static_cast<byte>(h >> 5); /* MSB of heap number */

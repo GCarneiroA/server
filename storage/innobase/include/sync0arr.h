@@ -1,7 +1,7 @@
 /*****************************************************************************
 
 Copyright (c) 1995, 2016, Oracle and/or its affiliates. All Rights Reserved.
-Copyright (c) 2015, 2018, MariaDB Corporation.
+Copyright (c) 2015, 2020, MariaDB Corporation.
 
 This program is free software; you can redistribute it and/or modify it under
 the terms of the GNU General Public License as published by the Free Software
@@ -46,7 +46,6 @@ UNIV_INLINE
 sync_array_t*
 sync_array_get_and_reserve_cell(
 	void*		object,	/*!< in: pointer to the object to wait for */
-	ulint		type,	/*!< in: lock request type */
 	const char*	file,	/*!< in: file where requested */
 	unsigned	line,	/*!< in: line where requested */
 	sync_cell_t**	cell);	/*!< out: the cell reserved, never NULL */
@@ -56,8 +55,7 @@ The event of the cell is reset to nonsignalled state. */
 sync_cell_t*
 sync_array_reserve_cell(
 	sync_array_t*	arr,	/*!< in: wait array */
-	void*		object, /*!< in: pointer to the object to wait for */
-	ulint		type,	/*!< in: lock request type */
+	void*		object,	/*!< in: pointer to the object to wait for */
 	const char*	file,	/*!< in: file where requested */
 	unsigned	line);	/*!< in: line where requested */
 
@@ -79,10 +77,9 @@ sync_array_free_cell(
 	sync_array_t*	arr,	/*!< in: wait array */
 	sync_cell_t*&	cell);	/*!< in: the reserved cell */
 
-/**********************************************************************//**
-Note that one of the wait objects was signalled. */
-void
-sync_array_object_signalled();
+/** count of how many times an object has been signalled */
+extern ulint sg_count;
+#define sync_array_object_signalled() ++sg_count
 
 /**********************************************************************//**
 Prints warnings of long semaphore waits to stderr.

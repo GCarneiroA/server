@@ -53,10 +53,9 @@ lock_wait_table_print(void)
 
 		fprintf(stderr,
 			"Slot %lu:"
-			" in use %lu, susp %lu, timeout %lu, time %lu\n",
+			" in use %lu, timeout %lu, time %lu\n",
 			(ulong) i,
 			(ulong) slot->in_use,
-			(ulong) slot->suspended,
 			slot->wait_timeout,
 			(ulong) difftime(time(NULL), slot->suspend_time));
 	}
@@ -154,7 +153,6 @@ lock_wait_table_reserve_slot(
 			}
 
 			os_event_reset(slot->event);
-			slot->suspended = TRUE;
 			slot->suspend_time = time(NULL);
 			slot->wait_timeout = wait_timeout;
 
@@ -195,8 +193,8 @@ wsrep_is_BF_lock_timeout(
 	const trx_t*	trx,
 	bool		locked = true)
 {
-	if (trx->is_wsrep() && wsrep_thd_is_BF(trx->mysql_thd, FALSE)
-	    && trx->error_state != DB_DEADLOCK) {
+	if (trx->error_state != DB_DEADLOCK && trx->is_wsrep() &&
+	    srv_monitor_timer && wsrep_thd_is_BF(trx->mysql_thd, FALSE)) {
 		ib::info() << "WSREP: BF lock wait long for trx:" << ib::hex(trx->id)
 			   << " query: " << wsrep_thd_query(trx->mysql_thd);
 		if (!locked) {
@@ -234,7 +232,6 @@ lock_wait_suspend_thread(
 {
 	srv_slot_t*	slot;
 	trx_t*		trx;
-	ibool		was_declared_inside_innodb;
 	ulong		lock_wait_timeout;
 
 	ut_a(lock_sys.timeout_timer.get());
@@ -329,16 +326,6 @@ lock_wait_suspend_thread(
 
 	/* Suspend this thread and wait for the event. */
 
-	was_declared_inside_innodb = trx->declared_to_be_inside_innodb;
-
-	if (was_declared_inside_innodb) {
-		/* We must declare this OS thread to exit InnoDB, since a
-		possible other thread holding a lock which this thread waits
-		for must be allowed to enter, sooner or later */
-
-		srv_conc_force_exit_innodb(trx);
-	}
-
 	/* Unknown is also treated like a record lock */
 	if (lock_type == ULINT_UNDEFINED || lock_type == LOCK_REC) {
 		thd_wait_begin(trx->mysql_thd, THD_WAIT_ROW_LOCK);
@@ -353,13 +340,6 @@ lock_wait_suspend_thread(
 
 	/* After resuming, reacquire the data dictionary latch if
 	necessary. */
-
-	if (was_declared_inside_innodb) {
-
-		/* Return back inside InnoDB */
-
-		srv_conc_force_enter_innodb(trx);
-	}
 
 	if (had_dict_lock) {
 
@@ -461,7 +441,6 @@ lock_wait_check_and_cancel(
 {
 	ut_ad(lock_wait_mutex_own());
 	ut_ad(slot->in_use);
-	ut_ad(slot->suspended);
 
 	double wait_time = difftime(time(NULL), slot->suspend_time);
 	trx_t* trx = thr_get_trx(slot->thr);
@@ -480,24 +459,21 @@ lock_wait_check_and_cancel(
 
 		lock_mutex_enter();
 
-		trx_mutex_enter(trx);
-
 		if (trx->lock.wait_lock != NULL) {
-
 			ut_a(trx->lock.que_state == TRX_QUE_LOCK_WAIT);
 
 #ifdef WITH_WSREP
                         if (!wsrep_is_BF_lock_timeout(trx)) {
 #endif /* WITH_WSREP */
+				mutex_enter(&trx->mutex);
 				lock_cancel_waiting_and_release(trx->lock.wait_lock);
+				mutex_exit(&trx->mutex);
 #ifdef WITH_WSREP
                         }
 #endif /* WITH_WSREP */
 		}
 
 		lock_mutex_exit();
-
-		trx_mutex_exit(trx);
 	}
 }
 

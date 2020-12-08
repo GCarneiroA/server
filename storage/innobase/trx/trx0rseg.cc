@@ -312,18 +312,16 @@ trx_rseg_header_create(
 {
 	buf_block_t*	block;
 
-	ut_ad(mtr->memo_contains(space->latch, MTR_MEMO_X_LOCK));
+	ut_ad(mtr->memo_contains(*space));
 	ut_ad(!sys_header == (space == fil_system.temp_space));
 
 	/* Allocate a new file segment for the rollback segment */
-	block = fseg_create(space, 0, TRX_RSEG + TRX_RSEG_FSEG_HEADER, mtr);
+	block = fseg_create(space, TRX_RSEG + TRX_RSEG_FSEG_HEADER, mtr);
 
 	if (block == NULL) {
 		/* No space left */
 		return block;
 	}
-
-	buf_block_dbg_add_level(block, SYNC_RSEG_HEADER_NEW);
 
 	ut_ad(0 == mach_read_from_4(TRX_RSEG_FORMAT + TRX_RSEG
 				    + block->frame));
@@ -391,7 +389,7 @@ trx_rseg_mem_free(trx_rseg_t* rseg)
 @param[in]	page_no		page number of the segment header */
 static
 trx_rseg_t*
-trx_rseg_mem_create(ulint id, fil_space_t* space, ulint page_no)
+trx_rseg_mem_create(ulint id, fil_space_t* space, uint32_t page_no)
 {
 	trx_rseg_t* rseg = static_cast<trx_rseg_t*>(
 		ut_zalloc_nokey(sizeof *rseg));
@@ -418,12 +416,12 @@ trx_rseg_mem_create(ulint id, fil_space_t* space, ulint page_no)
 @param[in,out]  max_trx_id      maximum observed transaction identifier
 @param[in]      rseg_header     rollback segment header
 @return the combined size of undo log segments in pages */
-static ulint trx_undo_lists_init(trx_rseg_t *rseg, trx_id_t &max_trx_id,
-                                 const buf_block_t *rseg_header)
+static uint32_t trx_undo_lists_init(trx_rseg_t *rseg, trx_id_t &max_trx_id,
+				    const buf_block_t *rseg_header)
 {
   ut_ad(srv_force_recovery < SRV_FORCE_NO_UNDO_LOG_SCAN);
 
-  ulint size= 0;
+  uint32_t size= 0;
 
   for (ulint i= 0; i < TRX_RSEG_N_SLOTS; i++)
   {
@@ -671,7 +669,7 @@ trx_rseg_create(ulint space_id)
 
 	mtr.start();
 
-	fil_space_t*	space = mtr_x_lock_space(space_id, &mtr);
+	fil_space_t*	space = mtr.x_lock_space(space_id);
 	ut_ad(space->purpose == FIL_TYPE_TABLESPACE);
 
 	if (buf_block_t* sys_header = trx_sysf_get(&mtr)) {
@@ -706,7 +704,7 @@ trx_temp_rseg_create()
 	for (ulong i = 0; i < TRX_SYS_N_RSEGS; i++) {
 		mtr.start();
 		mtr.set_log_mode(MTR_LOG_NO_REDO);
-		mtr_x_lock_space(fil_system.temp_space, &mtr);
+		mtr.x_lock_space(fil_system.temp_space);
 
 		buf_block_t* rblock = trx_rseg_header_create(
 			fil_system.temp_space, i, NULL, &mtr);

@@ -1,5 +1,5 @@
 /* Copyright (c) 2000, 2015, Oracle and/or its affiliates.
-   Copyright (c) 2008, 2015, MariaDB
+   Copyright (c) 2008, 2020, MariaDB
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -473,7 +473,8 @@ Item_sum::Item_sum(THD *thd, Item_sum *item):
     if (!(orig_args= (Item**) thd->alloc(sizeof(Item*)*arg_count)))
       return;
   }
-  memcpy(orig_args, item->orig_args, sizeof(Item*)*arg_count);
+  if (arg_count)
+    memcpy(orig_args, item->orig_args, sizeof(Item*)*arg_count);
   init_aggregator();
   with_distinct= item->with_distinct;
   if (item->aggr)
@@ -705,7 +706,7 @@ int Aggregator_distinct::composite_key_cmp(void* arg, uchar* key1, uchar* key2)
 
 C_MODE_START
 
-/* Declarations for auxilary C-callbacks */
+/* Declarations for auxiliary C-callbacks */
 
 int simple_raw_key_cmp(void* arg, const void* key1, const void* key2)
 {
@@ -737,7 +738,7 @@ C_MODE_END
   @param thd Thread descriptor
   @return status
     @retval FALSE success
-    @retval TRUE  faliure  
+    @retval TRUE  failure  
 
     Prepares Aggregator_distinct to process the incoming stream.
     Creates the temporary table and the Unique class if needed.
@@ -1132,7 +1133,8 @@ Item_sum_num::fix_fields(THD *thd, Item **ref)
       check_sum_func(thd, ref))
     return TRUE;
 
-  memcpy (orig_args, args, sizeof (Item *) * arg_count);
+  if (arg_count)
+    memcpy (orig_args, args, sizeof (Item *) * arg_count);
   fixed= 1;
   return FALSE;
 }
@@ -1365,7 +1367,8 @@ Item_sum_sp::fix_fields(THD *thd, Item **ref)
   if (check_sum_func(thd, ref))
     return TRUE;
 
-  memcpy(orig_args, args, sizeof(Item *) * arg_count);
+  if (arg_count)
+    memcpy(orig_args, args, sizeof(Item *) * arg_count);
   fixed= 1;
   return FALSE;
 }
@@ -1942,7 +1945,7 @@ void Item_sum_count::cleanup()
 
 
 /*
-  Avgerage
+  Average
 */
 
 void Item_sum_avg::fix_length_and_dec_decimal()
@@ -2208,7 +2211,7 @@ bool Item_sum_variance::fix_length_and_dec()
   /*
     According to the SQL2003 standard (Part 2, Foundations; sec 10.9,
     aggregate function; paragraph 7h of Syntax Rules), "the declared 
-    type of the result is an implementation-defined aproximate numeric
+    type of the result is an implementation-defined approximate numeric
     type.
   */
   if (args[0]->type_handler()->Item_sum_variance_fix_length_and_dec(this))
@@ -2283,7 +2286,7 @@ double Item_sum_variance::val_real()
     is one or zero.  If it's zero, i.e. a population variance, then we only
     set nullness when the count is zero.
 
-    Another way to read it is that 'sample' is the numerical threshhold, at and
+    Another way to read it is that 'sample' is the numerical threshold, at and
     below which a 'count' number of items is called NULL.
   */
   DBUG_ASSERT((sample == 0) || (sample == 1));
@@ -3928,7 +3931,8 @@ Item_func_group_concat(THD *thd, Name_resolution_context *context_arg,
 
   /* orig_args is only used for print() */
   orig_args= (Item**) (order + arg_count_order);
-  memcpy(orig_args, args, sizeof(Item*) * arg_count);
+  if (arg_count)
+    memcpy(orig_args, args, sizeof(Item*) * arg_count);
   if (limit_clause)
   {
     row_limit= row_limit_arg;
@@ -4336,7 +4340,7 @@ bool Item_func_group_concat::setup(THD *thd)
   {
     /*
       Force the create_tmp_table() to convert BIT columns to INT
-      as we cannot compare two table records containg BIT fields
+      as we cannot compare two table records containing BIT fields
       stored in the the tree used for distinct/order by.
       Moreover we don't even save in the tree record null bits 
       where BIT fields store parts of their data.

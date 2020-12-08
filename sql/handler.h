@@ -240,7 +240,7 @@ enum chf_create_flags {
   this flag must implement start_read_removal() and end_read_removal().
   The handler may return "fake" rows constructed from the key of the row
   asked for. This is used to optimize UPDATE and DELETE by reducing the
-  numer of roundtrips between handler and storage engine.
+  number of roundtrips between handler and storage engine.
   
   Example:
   UPDATE a=1 WHERE pk IN (<keys>)
@@ -582,7 +582,7 @@ enum enum_binlog_command {
 
 /* Bits in used_fields */
 #define HA_CREATE_USED_AUTO             (1UL << 0)
-#define HA_CREATE_USED_RAID             (1UL << 1) //RAID is no longer availble
+#define HA_CREATE_USED_RAID             (1UL << 1) //RAID is no longer available
 #define HA_CREATE_USED_UNION            (1UL << 2)
 #define HA_CREATE_USED_INSERT_METHOD    (1UL << 3)
 #define HA_CREATE_USED_MIN_ROWS         (1UL << 4)
@@ -866,8 +866,10 @@ struct xid_t {
   void set(long f, const char *g, long gl, const char *b, long bl)
   {
     formatID= f;
-    memcpy(data, g, gtrid_length= gl);
-    memcpy(data+gl, b, bqual_length= bl);
+    if ((gtrid_length= gl))
+      memcpy(data, g, gl);
+    if ((bqual_length= bl))
+      memcpy(data+gl, b, bl);
   }
   void set(ulonglong xid)
   {
@@ -1242,7 +1244,7 @@ struct handler_iterator {
   /*
     Pointer to buffer for the iterator to use.
     Should be allocated by function which created the iterator and
-    destroied by freed by above "destroy" call
+    destroyed by freed by above "destroy" call
   */
   void *buffer;
 };
@@ -1455,7 +1457,7 @@ struct handlerton
      "cookie".
 
      The flush and call of commit_checkpoint_notify_ha() need not happen
-     immediately - it can be scheduled and performed asynchroneously (ie. as
+     immediately - it can be scheduled and performed asynchronously (ie. as
      part of next prepare(), or sync every second, or whatever), but should
      not be postponed indefinitely. It is however also permissible to do it
      immediately, before returning from commit_checkpoint_request().
@@ -1551,7 +1553,7 @@ struct handlerton
      file extention. This is implied by the open_table_error()
      and the default discovery implementation.
      
-     Second element - data file extention. This is implied
+     Second element - data file extension. This is implied
      assumed by REPAIR TABLE ... USE_FRM implementation.
    */
    const char **tablefile_extensions; // by default - empty list
@@ -2297,7 +2299,7 @@ struct HA_CREATE_INFO: public Table_scope_and_contents_source_st,
          CONVERT TO CHARACTER SET DEFAULT
       to
          CONVERT TO CHARACTER SET <character-set-of-the-current-database>
-      TODO: Should't we postpone resolution of DEFAULT until the
+      TODO: Shouldn't we postpone resolution of DEFAULT until the
       character set of the table owner database is loaded from its db.opt?
     */
     DBUG_ASSERT(cs);
@@ -2513,6 +2515,9 @@ public:
 
   /** true for online operation (LOCK=NONE) */
   bool online;
+
+  /** which ALGORITHM and LOCK are supported by the storage engine */
+  enum_alter_inplace_result inplace_supported;
 
   /**
      Can be set by handler to describe why a given operation cannot be done
@@ -3090,7 +3095,7 @@ public:
   ha_statistics stats;
 
   /** MultiRangeRead-related members: */
-  range_seq_t mrr_iter;    /* Interator to traverse the range sequence */
+  range_seq_t mrr_iter;    /* Iterator to traverse the range sequence */
   RANGE_SEQ_IF mrr_funcs;  /* Range sequence traversal functions */
   HANDLER_BUFFER *multi_range_buffer; /* MRR buffer info */
   uint ranges_in_seq; /* Total number of ranges in the traversed sequence */
@@ -3273,9 +3278,6 @@ private:
   */
   Handler_share **ha_share;
 
-  /** Stores next_insert_id for handling duplicate key errors. */
-  ulonglong m_prev_insert_id;
-
 public:
   handler(handlerton *ht_arg, TABLE_SHARE *share_arg)
     :table_share(share_arg), table(0),
@@ -3303,7 +3305,7 @@ public:
     m_psi_numrows(0),
     m_psi_locker(NULL),
     row_logging(0), row_logging_init(0),
-    m_lock_type(F_UNLCK), ha_share(NULL), m_prev_insert_id(0)
+    m_lock_type(F_UNLCK), ha_share(NULL)
   {
     DBUG_PRINT("info",
                ("handler created F_UNLCK %d F_RDLCK %d F_WRLCK %d",
@@ -4023,16 +4025,6 @@ public:
       insert_id_for_cur_row;
   }
 
-  /** Store and restore next_insert_id over duplicate key errors. */
-  virtual void store_auto_increment()
-  {
-    m_prev_insert_id= next_insert_id;
-  }
-  virtual void restore_auto_increment()
-  {
-    restore_auto_increment(m_prev_insert_id);
-  }
-
   virtual void update_create_info(HA_CREATE_INFO *create_info) {}
   int check_old_types();
   virtual int assign_to_keycache(THD* thd, HA_CHECK_OPT* check_opt)
@@ -4185,7 +4177,7 @@ public:
     This method offers the storage engine, the possibility to store a reference
     to a table name which is going to be used with query cache. 
     The method is called each time a statement is written to the cache and can
-    be used to verify if a specific statement is cachable. It also offers
+    be used to verify if a specific statement is cacheable. It also offers
     the possibility to register a generic (but static) call back function which
     is called each time a statement is matched against the query cache.
 

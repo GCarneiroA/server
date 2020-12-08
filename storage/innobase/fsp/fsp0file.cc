@@ -296,20 +296,18 @@ Datafile::read_first_page(bool read_only_mode)
 	m_first_page = static_cast<byte*>(
 		aligned_malloc(UNIV_PAGE_SIZE_MAX, srv_page_size));
 
-	IORequest	request;
 	dberr_t		err = DB_ERROR;
 	size_t		page_size = UNIV_PAGE_SIZE_MAX;
 
 	/* Don't want unnecessary complaints about partial reads. */
-
-	request.disable_partial_io_warnings();
 
 	while (page_size >= UNIV_PAGE_SIZE_MIN) {
 
 		ulint	n_read = 0;
 
 		err = os_file_read_no_error_handling(
-			request, m_handle, m_first_page, 0, page_size, &n_read);
+			IORequestReadPartial, m_handle, m_first_page, 0,
+			page_size, &n_read);
 
 		if (err == DB_IO_ERROR && n_read >= UNIV_PAGE_SIZE_MIN) {
 
@@ -768,10 +766,10 @@ Datafile::restore_from_doublewrite()
 	}
 
 	/* Find if double write buffer contains page_no of given space id. */
-	const byte*	page = recv_sys.dblwr.find_page(m_space_id, 0);
 	const page_id_t	page_id(m_space_id, 0);
+	const byte*	page = recv_sys.dblwr.find_page(page_id);
 
-	if (page == NULL) {
+	if (!page) {
 		/* If the first page of the given user tablespace is not there
 		in the doublewrite buffer, then the recovery is going to fail
 		now. Hence this is treated as an error. */
@@ -788,15 +786,10 @@ Datafile::restore_from_doublewrite()
 		FSP_HEADER_OFFSET + FSP_SPACE_FLAGS + page);
 
 	if (!fil_space_t::is_valid_flags(flags, m_space_id)) {
-		ulint cflags = fsp_flags_convert_from_101(flags);
-		if (cflags == ULINT_UNDEFINED) {
-			ib::warn()
-				<< "Ignoring a doublewrite copy of page "
-				<< page_id
-				<< " due to invalid flags " << ib::hex(flags);
-			return(true);
-		}
-		flags = cflags;
+		flags = fsp_flags_convert_from_101(flags);
+		/* recv_dblwr_t::validate_page() inside find_page()
+		checked this already. */
+		ut_ad(flags != ULINT_UNDEFINED);
 		/* The flags on the page should be converted later. */
 	}
 
@@ -810,10 +803,8 @@ Datafile::restore_from_doublewrite()
 		<< physical_size << " bytes into file '"
 		<< m_filepath << "'";
 
-	IORequest	request(IORequest::WRITE);
-
 	return(os_file_write(
-			request,
+			IORequestWrite,
 			m_filepath, m_handle, page, 0, physical_size)
 	       != DB_SUCCESS);
 }

@@ -27,6 +27,7 @@ Created 12/9/1995 Heikki Tuuri
 #include "mach0data.h"
 #include "assume_aligned.h"
 #include "ut0crc32.h"
+#include "sync0debug.h"
 
 extern ulong srv_log_buffer_size;
 
@@ -255,7 +256,7 @@ log_reserve_and_write_fast(
 	ulint		len,
 	lsn_t*		start_lsn)
 {
-	ut_ad(log_mutex_own());
+	mysql_mutex_assert_owner(&log_sys.mutex);
 	ut_ad(len > 0);
 
 	const ulint	data_len = len
@@ -290,18 +291,6 @@ log_reserve_and_write_fast(
 	return lsn;
 }
 
-/****************************************************************
-Get log_sys::max_modified_age_async. It is OK to read the value without
-holding log_sys::mutex because it is constant.
-@return max_modified_age_async */
-UNIV_INLINE
-lsn_t
-log_get_max_modified_age_async(void)
-/*================================*/
-{
-	return(log_sys.max_modified_age_async);
-}
-
 /***********************************************************************//**
 Checks if there is need for a log buffer flush or a new checkpoint, and does
 this if yes. Any database operation should call this when it has modified
@@ -320,10 +309,6 @@ log_free_check(void)
 	static const latch_level_t latches[] = {
 		SYNC_DICT,		/* dict_sys.mutex during
 					commit_try_rebuild() */
-		SYNC_DICT_OPERATION,	/* dict_sys.latch X-latch during
-					commit_try_rebuild() */
-		SYNC_FTS_CACHE,		/* fts_cache_t::lock */
-		SYNC_INDEX_TREE		/* index->lock */
 	};
 #endif /* UNIV_DEBUG */
 

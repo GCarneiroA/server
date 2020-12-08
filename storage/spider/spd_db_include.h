@@ -961,6 +961,9 @@ public:
   virtual bool tables_on_different_db_are_joinable();
   virtual bool socket_has_default_value();
   virtual bool database_has_default_value();
+  virtual bool default_file_has_default_value();
+  virtual bool host_has_default_value();
+  virtual bool port_has_default_value();
   virtual bool append_charset_name_before_string();
   virtual uint limit_mode();
 };
@@ -1355,6 +1358,7 @@ public:
   SPIDER_LINK_IDX_CHAIN *link_idx_chain;
 #endif
   bool strict_group_by;
+  bool no_where_cond;
   spider_db_handler(ha_spider *spider, spider_db_share *db_share) :
     dbton_id(db_share->dbton_id), spider(spider), db_share(db_share),
     first_link_idx(-1) {}

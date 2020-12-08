@@ -82,8 +82,6 @@ IF(INNODB_COMPILER_HINTS)
    ADD_DEFINITIONS("-DCOMPILER_HINTS")
 ENDIF()
 
-SET(MUTEXTYPE "event" CACHE STRING "Mutex type: event, sys or futex")
-
 # Enable InnoDB's UNIV_DEBUG in debug builds
 SET(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -DUNIV_DEBUG")
 
@@ -130,47 +128,7 @@ IF(NOT MSVC)
      CMAKE_C_COMPILER_VERSION VERSION_LESS "6.0.0")
     SET_SOURCE_FILES_PROPERTIES(trx/trx0rec.cc PROPERTIES COMPILE_FLAGS -O1)
   ENDIF()
-
-# Only use futexes on Linux if GCC atomics are available
-IF(NOT MSVC AND NOT CMAKE_CROSSCOMPILING)
-  CHECK_C_SOURCE_RUNS(
-  "
-  #include <stdio.h>
-  #include <unistd.h>
-  #include <errno.h>
-  #include <assert.h>
-  #include <linux/futex.h>
-  #include <unistd.h>
-  #include <sys/syscall.h>
-
-   int futex_wait(int* futex, int v) {
-	return(syscall(SYS_futex, futex, FUTEX_WAIT_PRIVATE, v, NULL, NULL, 0));
-   }
-
-   int futex_signal(int* futex) {
-	return(syscall(SYS_futex, futex, FUTEX_WAKE, 1, NULL, NULL, 0));
-   }
-
-  int main() {
-	int	ret;
-	int	m = 1;
-
-	/* It is setup to fail and return EWOULDBLOCK. */
-	ret = futex_wait(&m, 0);
-	assert(ret == -1 && errno == EWOULDBLOCK);
-	/* Shouldn't wake up any threads. */
-	assert(futex_signal(&m) == 0);
-
-	return(0);
-  }"
-  HAVE_IB_LINUX_FUTEX)
 ENDIF()
-
-IF(HAVE_IB_LINUX_FUTEX)
-  ADD_DEFINITIONS(-DHAVE_IB_LINUX_FUTEX=1)
-ENDIF()
-
-ENDIF(NOT MSVC)
 
 CHECK_FUNCTION_EXISTS(vasprintf  HAVE_VASPRINTF)
 
@@ -183,7 +141,7 @@ SET(MUTEXTYPE "event" CACHE STRING "Mutex type: event, sys or futex")
 
 IF(MUTEXTYPE MATCHES "event")
   ADD_DEFINITIONS(-DMUTEX_EVENT)
-ELSEIF(MUTEXTYPE MATCHES "futex" AND DEFINED HAVE_IB_LINUX_FUTEX)
+ELSEIF(MUTEXTYPE MATCHES "futex" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
   ADD_DEFINITIONS(-DMUTEX_FUTEX)
 ELSE()
    ADD_DEFINITIONS(-DMUTEX_SYS)
@@ -209,16 +167,6 @@ IF(CMAKE_CXX_COMPILER_ID MATCHES "SunPro"
     PROPERTIES COMPILE_FLAGS -xO3)
 ENDIF()
 
-# Avoid generating Hardware Capabilities due to crc32 instructions
-IF(CMAKE_SYSTEM_NAME MATCHES "SunOS" AND CMAKE_SYSTEM_PROCESSOR MATCHES "i386")
-  MY_CHECK_CXX_COMPILER_FLAG("-Wa,-nH")
-  IF(have_CXX__Wa__nH)
-    ADD_COMPILE_FLAGS(
-      ut/ut0crc32.cc
-      COMPILE_FLAGS "-Wa,-nH"
-    )
-  ENDIF()
-ENDIF()
 
 IF(MSVC)
   # Avoid "unreferenced label" warning in generated file

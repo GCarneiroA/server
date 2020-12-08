@@ -1205,8 +1205,6 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
 
   CHARSET_INFO *db_cs= get_default_db_collation(thd, sp->m_db.str);
 
-  enum_check_fields saved_count_cuted_fields;
-
   bool store_failed= FALSE;
   DBUG_ENTER("sp_create_routine");
   DBUG_PRINT("enter", ("type: %s  name: %.*s",
@@ -1240,8 +1238,7 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
   /* Reset sql_mode during data dictionary operations. */
   thd->variables.sql_mode= 0;
 
-  saved_count_cuted_fields= thd->count_cuted_fields;
-  thd->count_cuted_fields= CHECK_FIELD_WARN;
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_WARN);
 
   if (!(table= open_proc_table_for_update(thd)))
   {
@@ -1258,20 +1255,20 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
         switch (type()) {
         case SP_TYPE_PACKAGE:
           // Drop together with its PACKAGE BODY mysql.proc record
-          ret= sp_handler_package_spec.sp_find_and_drop_routine(thd, table, sp);
+          if (sp_handler_package_spec.sp_find_and_drop_routine(thd, table, sp))
+            goto done;
           break;
         case SP_TYPE_PACKAGE_BODY:
         case SP_TYPE_FUNCTION:
         case SP_TYPE_PROCEDURE:
-          ret= sp_drop_routine_internal(thd, sp, table);
+          if (sp_drop_routine_internal(thd, sp, table))
+            goto done;
           break;
         case SP_TYPE_TRIGGER:
         case SP_TYPE_EVENT:
           DBUG_ASSERT(0);
           ret= SP_OK;
         }
-        if (ret != SP_OK)
-          goto done;
       }
       else if (lex->create_info.if_not_exists())
       {
@@ -1286,7 +1283,7 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
         if (type() == SP_TYPE_FUNCTION)
         {
           sp_returns_type(thd, retstr, sp);
-          returns= retstr.lex_cstring();
+          retstr.get_value(&returns);
         }
         goto log;
       }
@@ -1369,7 +1366,7 @@ Sp_handler::sp_create_routine(THD *thd, const sp_head *sp) const
     if (type() == SP_TYPE_FUNCTION)
     {
       sp_returns_type(thd, retstr, sp);
-      returns= retstr.lex_cstring();
+      retstr.get_value(&returns);
 
       store_failed= store_failed ||
         table->field[MYSQL_PROC_FIELD_RETURNS]->
@@ -1500,7 +1497,6 @@ log:
   ret= FALSE;
 
 done:
-  thd->count_cuted_fields= saved_count_cuted_fields;
   thd->variables.sql_mode= saved_mode;
   DBUG_ASSERT(!thd->is_current_stmt_binlog_format_row());
   DBUG_RETURN(ret);
@@ -2061,7 +2057,7 @@ Sp_handler::sp_clone_and_link_routine(THD *thd,
   if (type() == SP_TYPE_FUNCTION)
   {
     sp_returns_type(thd, retstr, sp);
-    returns= retstr.lex_cstring();
+    retstr.get_value(&returns);
   }
 
   if (sp->m_parent)

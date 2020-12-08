@@ -57,7 +57,7 @@ public:
 	PageBulk(
 		dict_index_t*	index,
 		trx_id_t	trx_id,
-		ulint		page_no,
+		uint32_t	page_no,
 		ulint		level)
 		:
 		m_heap(NULL),
@@ -118,6 +118,9 @@ public:
 	dirs, and set page header members. */
 	inline void finish();
 
+  /** @return whether finish() actually needs to do something */
+  inline bool needs_finish() const;
+
 	/** Commit mtr for a page
 	@param[in]	success		Flag whether all inserts succeed. */
 	void commit(bool success);
@@ -176,10 +179,7 @@ public:
 	inline bool isSpaceAvailable(ulint	rec_size);
 
 	/** Get page no */
-	ulint	getPageNo()
-	{
-		return(m_page_no);
-	}
+	uint32_t getPageNo() const { return m_page_no; }
 
 	/** Get page level */
 	ulint	getLevel()
@@ -238,7 +238,7 @@ private:
 	rec_t*		m_cur_rec;
 
 	/** The page no */
-	ulint		m_page_no;
+	uint32_t	m_page_no;
 
 	/** The page level in B-tree */
 	ulint		m_level;

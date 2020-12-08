@@ -36,7 +36,6 @@ Created 3/26/1996 Heikki Tuuri
 #include "srv0mon.h"
 #include "srv0srv.h"
 #include "srv0start.h"
-#include "sync0sync.h"
 #include "trx0rec.h"
 #include "trx0roll.h"
 #include "trx0rseg.h"
@@ -44,6 +43,10 @@ Created 3/26/1996 Heikki Tuuri
 #include <mysql/service_wsrep.h>
 
 #include <unordered_map>
+
+#ifdef UNIV_PFS_RWLOCK
+extern mysql_pfs_key_t trx_purge_latch_key;
+#endif /* UNIV_PFS_RWLOCK */
 
 /** Maximum allowable purge history length.  <=0 means 'infinite'. */
 ulong		srv_max_purge_lag = 0;
@@ -172,7 +175,7 @@ void purge_sys_t::create()
   offset= 0;
   hdr_page_no= 0;
   hdr_offset= 0;
-  rw_lock_create(trx_purge_latch_key, &latch, SYNC_PURGE_LATCH);
+  latch.SRW_LOCK_INIT(trx_purge_latch_key);
   mutex_create(LATCH_ID_PURGE_SYS_PQ, &pq_mutex);
   truncate.current= NULL;
   truncate.last= NULL;
@@ -192,8 +195,8 @@ void purge_sys_t::close()
   ut_ad(!trx->id);
   ut_ad(trx->state == TRX_STATE_ACTIVE);
   trx->state= TRX_STATE_NOT_STARTED;
-  trx_free(trx);
-  rw_lock_free(&latch);
+  trx->free();
+  latch.destroy();
   mutex_free(&pq_mutex);
   mem_heap_free(heap);
   heap= nullptr;
@@ -262,7 +265,7 @@ trx_purge_add_undo_to_history(const trx_t* trx, trx_undo_t*& undo, mtr_t* mtr)
 	or in trx_rollback_recovered() in slow shutdown.
 
 	Before any transaction-generating background threads or the
-	purge have been started, recv_recovery_rollback_active() can
+	purge have been started, we can
 	start transactions in row_merge_drop_temp_indexes() and
 	fts_drop_orphaned_tables(), and roll back recovered transactions.
 
@@ -584,11 +587,10 @@ static void trx_purge_truncate_history()
 				     : 0, j = i;; ) {
 				ulint space_id = srv_undo_space_id_start + i;
 				ut_ad(srv_is_undo_tablespace(space_id));
+				fil_space_t* space= fil_space_get(space_id);
 
-				if (fil_space_get_size(space_id)
-				    > threshold) {
-					purge_sys.truncate.current
-						= fil_space_get(space_id);
+				if (space && space->get_size() > threshold) {
+					purge_sys.truncate.current = space;
 					break;
 				}
 
@@ -680,7 +682,7 @@ not_free:
 		mini-transaction commit and the server was killed, then
 		discarding the to-be-trimmed pages without flushing would
 		break crash recovery. So, we cannot avoid the write. */
-		buf_LRU_flush_or_remove_pages(space.id, true);
+		while (buf_flush_dirty_pages(space.id));
 
 		log_free_check();
 
@@ -695,7 +697,7 @@ not_free:
 		mtr_t mtr;
 		const ulint size = SRV_UNDO_TABLESPACE_SIZE_IN_PAGES;
 		mtr.start();
-		mtr_x_lock_space(purge_sys.truncate.current, &mtr);
+		mtr.x_lock_space(purge_sys.truncate.current);
 		/* Associate the undo tablespace with mtr.
 		During mtr::commit(), InnoDB can use the undo
 		tablespace object to clear all freed ranges */
@@ -778,12 +780,12 @@ not_free:
 		/* This is only executed by srv_purge_coordinator_thread. */
 		export_vars.innodb_undo_truncations++;
 
-		/* TODO: PUNCH_HOLE the garbage (with write-ahead logging) */
+		/* In MDEV-8319 (10.5) we will PUNCH_HOLE the garbage
+		(with write-ahead logging). */
 		mutex_enter(&fil_system.mutex);
 		ut_ad(&space == purge_sys.truncate.current);
-		ut_ad(space.stop_new_ops);
 		ut_ad(space.is_being_truncated);
-		purge_sys.truncate.current->stop_new_ops = false;
+		purge_sys.truncate.current->set_stopping(false);
 		purge_sys.truncate.current->is_being_truncated = false;
 		mutex_exit(&fil_system.mutex);
 

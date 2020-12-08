@@ -525,17 +525,27 @@ row_quiesce_table_start(
 	}
 
 	for (ulint count = 0;
-	     ibuf_merge_space(table->space_id) != 0
-	     && !trx_is_interrupted(trx);
+	     ibuf_merge_space(table->space_id);
 	     ++count) {
+		if (trx_is_interrupted(trx)) {
+			goto aborted;
+		}
 		if (!(count % 20)) {
 			ib::info() << "Merging change buffer entries for "
 				<< table->name;
 		}
 	}
 
+	while (buf_flush_dirty_pages(table->space_id)) {
+		if (trx_is_interrupted(trx)) {
+			goto aborted;
+		}
+	}
+
 	if (!trx_is_interrupted(trx)) {
-		buf_LRU_flush_or_remove_pages(table->space_id, true);
+		/* Ensure that all asynchronous IO is completed. */
+		os_aio_wait_until_no_pending_writes();
+		table->space->flush();
 
 		if (row_quiesce_write_cfg(table, trx->mysql_thd)
 		    != DB_SUCCESS) {
@@ -546,6 +556,7 @@ row_quiesce_table_start(
 				<< " flushed to disk";
 		}
 	} else {
+aborted:
 		ib::warn() << "Quiesce aborted!";
 	}
 
@@ -659,12 +670,17 @@ row_quiesce_set_state(
 			    " FTS auxiliary tables will not be flushed.");
 	}
 
+	dict_index_t* clust_index = dict_table_get_first_index(table);
+
 	row_mysql_lock_data_dictionary(trx);
-	for (dict_index_t* index = dict_table_get_first_index(table);
+
+	for (dict_index_t* index = dict_table_get_next_index(clust_index);
 	     index != NULL;
 	     index = dict_table_get_next_index(index)) {
-		rw_lock_x_lock(&index->lock);
+		index->lock.x_lock(SRW_LOCK_CALL);
 	}
+
+	clust_index->lock.x_lock(SRW_LOCK_CALL);
 
 	switch (state) {
 	case QUIESCE_START:
@@ -684,7 +700,7 @@ row_quiesce_set_state(
 	for (dict_index_t* index = dict_table_get_first_index(table);
 	     index != NULL;
 	     index = dict_table_get_next_index(index)) {
-		rw_lock_x_unlock(&index->lock);
+		index->lock.x_unlock();
 	}
 
 	row_mysql_unlock_data_dictionary(trx);

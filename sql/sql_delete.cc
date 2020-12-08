@@ -248,6 +248,7 @@ int update_portion_of_time(THD *thd, TABLE *table,
   uint dst_fieldno= lcond ? table->s->period.end_fieldno
                           : table->s->period.start_fieldno;
 
+  ulonglong prev_insert_id= table->file->next_insert_id;
   store_record(table, record[1]);
   if (likely(!res))
     res= src->save_in_field(table->field[dst_fieldno], true);
@@ -262,6 +263,8 @@ int update_portion_of_time(THD *thd, TABLE *table,
     res= table->triggers->process_triggers(thd, TRG_EVENT_INSERT,
                                            TRG_ACTION_AFTER, true);
   restore_record(table, record[1]);
+  if (res)
+    table->file->restore_auto_increment(prev_insert_id);
 
   if (likely(!res) && lcond && rcond)
     res= table->period_make_insert(period_conds.end.item,
@@ -356,6 +359,16 @@ bool mysql_delete(THD *thd, TABLE_LIST *table_list, COND *conds,
 
   if (mysql_prepare_delete(thd, table_list, &conds, &delete_while_scanning))
     DBUG_RETURN(TRUE);
+
+  if (table_list->has_period())
+  {
+    if (!table_list->period_conditions.start.item->const_item()
+        || !table_list->period_conditions.end.item->const_item())
+    {
+      my_error(ER_NOT_CONSTANT_EXPRESSION, MYF(0), "FOR PORTION OF");
+      DBUG_RETURN(true);
+    }
+  }
 
   if (delete_history)
     table->vers_write= false;

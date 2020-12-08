@@ -34,6 +34,7 @@
 #include "sql_tvc.h"
 #include "item.h"
 #include "sql_limit.h"                // Select_limit_counters
+#include "sql_schema.h"
 
 /* Used for flags of nesting constructs */
 #define SELECT_NESTING_MAP_SIZE 64
@@ -85,13 +86,13 @@ public:
   bool is_quoted() const { return m_quote != '\0'; }
   char quote() const { return m_quote; }
   // Get string repertoire by the 8-bit flag and the character set
-  uint repertoire(CHARSET_INFO *cs) const
+  my_repertoire_t repertoire(CHARSET_INFO *cs) const
   {
     return !m_is_8bit && my_charset_is_ascii_based(cs) ?
            MY_REPERTOIRE_ASCII : MY_REPERTOIRE_UNICODE30;
   }
   // Get string repertoire by the 8-bit flag, for ASCII-based character sets
-  uint repertoire() const
+  my_repertoire_t repertoire() const
   {
     return !m_is_8bit ? MY_REPERTOIRE_ASCII : MY_REPERTOIRE_UNICODE30;
   }
@@ -1112,7 +1113,7 @@ public:
   */
   LEX *parent_lex;
   enum olap_type olap;
-  /* FROM clause - points to the beginning of the TABLE_LIST::next_local list. */
+  /* FROM clause - points to the beginning of the TABLE_LIST::next_local list */
   SQL_I_List<TABLE_LIST>  table_list;
 
   /*
@@ -1128,8 +1129,8 @@ public:
   List<Item>          pre_fix; /* above list before fix_fields */
   bool                is_item_list_lookup;
   /* 
-    Usualy it is pointer to ftfunc_list_alloc, but in union used to create fake
-    select_lex for calling mysql_select under results of union
+    Usually it is pointer to ftfunc_list_alloc, but in union used to create
+    fake select_lex for calling mysql_select under results of union
   */
   List<Item_func_match> *ftfunc_list;
   List<Item_func_match> ftfunc_list_alloc;
@@ -1215,6 +1216,14 @@ public:
    converted to a GROUP BY involving BIT fields.
   */
   uint hidden_bit_fields;
+  /*
+    Number of fields used in the definition of all the windows functions.
+    This includes:
+      1) Fields in the arguments
+      2) Fields in the PARTITION BY clause
+      3) Fields in the ORDER BY clause
+  */
+  uint fields_in_window_functions;
   enum_parsing_place parsing_place; /* where we are parsing expression */
   enum_parsing_place save_parsing_place;
   enum_parsing_place context_analysis_place; /* where we are in prepare */
@@ -1284,6 +1293,8 @@ public:
   bool no_wrap_view_item;
   /* exclude this select from check of unique_table() */
   bool exclude_from_table_unique_test;
+  /* the select is "service-select" and can not have tables*/
+  bool is_service_select;
   /* index in the select list of the expression currently being fixed */
   int cur_pos_in_select_list;
 
@@ -1323,10 +1334,8 @@ public:
   table_value_constr *tvc;
   bool in_tvc;
 
-  /* The interface employed to execute the select query by a foreign engine */
-  select_handler *select_h;
   /* The object used to organize execution of the query by a foreign engine */
-  Pushdown_select *pushdown_select;
+  select_handler *pushdown_select;
 
   /** System Versioning */
 public:
@@ -1548,10 +1557,7 @@ public:
                        SQL_I_List<ORDER> win_order_list,
                        Window_frame *win_frame);
   List<Item_window_func> window_funcs;
-  bool add_window_func(Item_window_func *win_func)
-  {
-    return window_funcs.push_back(win_func);
-  }
+  bool add_window_func(Item_window_func *win_func);
 
   bool have_window_funcs() const { return (window_funcs.elements !=0); }
   ORDER *find_common_window_func_partition_fields(THD *thd);
@@ -2349,6 +2355,7 @@ private:
 struct st_parsing_options
 {
   bool allows_variable;
+  bool lookup_keywords_after_qualifier;
 
   st_parsing_options() { reset(); }
   void reset();
@@ -3693,8 +3700,10 @@ public:
 
     if (unlikely(!select_stack_top))
     {
-      current_select= NULL;
-      DBUG_PRINT("info", ("Top Select is empty"));
+      current_select= &builtin_select;
+      DBUG_PRINT("info", ("Top Select is empty -> sel builtin: %p  service: %u",
+                          current_select, builtin_select.is_service_select));
+      builtin_select.is_service_select= false;
     }
     else
       current_select= select_stack[select_stack_top - 1];
@@ -4460,6 +4469,12 @@ public:
 
   int add_period(Lex_ident name, Lex_ident_sys_st start, Lex_ident_sys_st end)
   {
+    if (lex_string_cmp(system_charset_info, &start, &end) == 0)
+    {
+      my_error(ER_FIELD_SPECIFIED_TWICE, MYF(0), start.str);
+      return 1;
+    }
+
     Table_period_info &info= create_info.period_info;
 
     if (check_exists && info.name.streq(name))
@@ -4520,7 +4535,7 @@ public:
     wild= 0;
     exchange= 0;
   }
-  bool main_select_push();
+  bool main_select_push(bool service= false);
   bool insert_select_hack(SELECT_LEX *sel);
   SELECT_LEX *create_priority_nest(SELECT_LEX *first_in_nest);
 
@@ -4665,7 +4680,18 @@ public:
   bool set_cast_type_udt(Lex_cast_type_st *type,
                          const LEX_CSTRING &name);
 
+  bool map_data_type(const Lex_ident_sys_st &schema,
+                     Lex_field_type_st *type) const;
+
   void mark_first_table_as_inserting();
+
+  bool fields_are_impossible()
+  {
+    // no select or it is last select with no tables (service select)
+    return !select_stack_head() ||
+           (select_stack_top == 1 &&
+            select_stack[0]->is_service_select);
+  }
 
   bool add_table_foreign_key(const LEX_CSTRING *name,
                              const LEX_CSTRING *constraint_name,

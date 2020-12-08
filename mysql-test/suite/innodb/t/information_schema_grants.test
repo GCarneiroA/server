@@ -64,14 +64,8 @@ create sql security definer view d_locks as select * from information_schema.inn
 create sql security invoker view i_metrics as select * from information_schema.innodb_metrics;
 create sql security definer view d_metrics as select * from information_schema.innodb_metrics;
 
-create sql security invoker view i_mutexes as select * from information_schema.innodb_mutexes;
-create sql security definer view d_mutexes as select * from information_schema.innodb_mutexes;
-
 create sql security invoker view i_sys_columns as select * from information_schema.innodb_sys_columns;
 create sql security definer view d_sys_columns as select * from information_schema.innodb_sys_columns;
-
-create sql security invoker view i_sys_datafiles as select * from information_schema.innodb_sys_datafiles;
-create sql security definer view d_sys_datafiles as select * from information_schema.innodb_sys_datafiles;
 
 create sql security invoker view i_sys_fields as select * from information_schema.innodb_sys_fields;
 create sql security definer view d_sys_fields as select * from information_schema.innodb_sys_fields;
@@ -213,22 +207,10 @@ select count(*) > -1 from i_metrics;
 select count(*) > -1 from d_metrics;
 
 --error ER_SPECIFIC_ACCESS_DENIED_ERROR
-select count(*) > -1 from information_schema.innodb_mutexes;
---error ER_SPECIFIC_ACCESS_DENIED_ERROR
-select count(*) > -1 from i_mutexes;
-select count(*) > -1 from d_mutexes;
-
---error ER_SPECIFIC_ACCESS_DENIED_ERROR
 select count(*) > -1 from information_schema.innodb_sys_columns;
 --error ER_SPECIFIC_ACCESS_DENIED_ERROR
 select count(*) > -1 from i_sys_columns;
 select count(*) > -1 from d_sys_columns;
-
---error ER_SPECIFIC_ACCESS_DENIED_ERROR
-select count(*) > -1 from information_schema.innodb_sys_datafiles;
---error ER_SPECIFIC_ACCESS_DENIED_ERROR
-select count(*) > -1 from i_sys_datafiles;
-select count(*) > -1 from d_sys_datafiles;
 
 --error ER_SPECIFIC_ACCESS_DENIED_ERROR
 select count(*) > -1 from information_schema.innodb_sys_fields;

@@ -1331,23 +1331,6 @@ row_mysql_get_table_status(
 	return(err);
 }
 
-/** Writes 8 bytes to nth tuple field
-@param[in]	tuple	where to write
-@param[in]	nth	index in tuple
-@param[in]	data	what to write
-@param[in]	buf	field data buffer */
-static
-void
-set_tuple_col_8(dtuple_t* tuple, int col, uint64_t data, byte* buf) {
-	dfield_t* dfield = dtuple_get_nth_field(tuple, col);
-	ut_ad(dfield->type.len == 8);
-	if (dfield->len == UNIV_SQL_NULL) {
-		dfield_set_data(dfield, buf, 8);
-	}
-	ut_ad(dfield->len == dfield->type.len && dfield->data);
-	mach_write_to_8(dfield->data, data);
-}
-
 /** Does an insert for MySQL.
 @param[in]	mysql_rec	row in the MySQL format
 @param[in,out]	prebuilt	prebuilt struct in MySQL handle
@@ -1415,29 +1398,8 @@ row_insert_for_mysql(
 					  &blob_heap);
 
 	if (ins_mode != ROW_INS_NORMAL) {
-#ifndef DBUG_OFF
-		ut_ad(table->vers_start != table->vers_end);
-		const mysql_row_templ_t* t
-		    = prebuilt->get_template_by_col(table->vers_end);
-		ut_ad(t);
-		ut_ad(t->mysql_col_len == 8);
-#endif
-
-		if (ins_mode == ROW_INS_HISTORICAL) {
-			set_tuple_col_8(node->row, table->vers_end, trx->id,
-					node->vers_end_buf);
-		} else /* ROW_INS_VERSIONED */ {
-			set_tuple_col_8(node->row, table->vers_end, TRX_ID_MAX,
-					node->vers_end_buf);
-#ifndef DBUG_OFF
-			t = prebuilt->get_template_by_col(table->vers_start);
-			ut_ad(t);
-			ut_ad(t->mysql_col_len == 8);
-#endif
-			set_tuple_col_8(node->row, table->vers_start, trx->id,
-					node->vers_start_buf);
-		}
-	}
+          node->vers_update_end(prebuilt, ins_mode == ROW_INS_HISTORICAL);
+        }
 
 	savept = trx_savept_take(trx);
 
@@ -1560,7 +1522,7 @@ error_exit:
 		srv_stats.n_rows_inserted.inc(size_t(trx->id));
 	}
 
-	/* Not protected by dict_table_stats_lock() for performance
+	/* Not protected by dict_sys.mutex for performance
 	reasons, we would rather get garbage in stat_n_rows (which is
 	just an estimate anyway) than protecting the following code
 	with a latch. */
@@ -1871,10 +1833,10 @@ row_update_for_mysql(row_prebuilt_t* prebuilt)
 
 	if (prebuilt->versioned_write) {
 		if (node->is_delete == VERSIONED_DELETE) {
-			node->make_versioned_delete(trx);
-		} else if (node->update->affects_versioned()) {
-			node->make_versioned_update(trx);
-		}
+                  node->vers_make_delete(trx);
+                } else if (node->update->affects_versioned()) {
+                  node->vers_make_update(trx);
+                }
 	}
 
 	for (;;) {
@@ -1930,7 +1892,7 @@ row_update_for_mysql(row_prebuilt_t* prebuilt)
 	ut_ad(is_delete == (node->is_delete == PLAIN_DELETE));
 
 	if (is_delete) {
-		/* Not protected by dict_table_stats_lock() for performance
+		/* Not protected by dict_sys.mutex for performance
 		reasons, we would rather get garbage in stat_n_rows (which is
 		just an estimate anyway) than protecting the following code
 		with a latch. */
@@ -2098,18 +2060,11 @@ no_unlock:
 /*********************************************************************//**
 Locks the data dictionary in shared mode from modifications, for performing
 foreign key check, rollback, or other operation invisible to MySQL. */
-void
-row_mysql_freeze_data_dictionary_func(
-/*==================================*/
-	trx_t*		trx,	/*!< in/out: transaction */
-	const char*	file,	/*!< in: file name */
-	unsigned	line)	/*!< in: line number */
+void row_mysql_freeze_data_dictionary(trx_t *trx)
 {
-	ut_a(trx->dict_operation_lock_mode == 0);
-
-	rw_lock_s_lock_inline(&dict_sys.latch, 0, file, line);
-
-	trx->dict_operation_lock_mode = RW_S_LATCH;
+  ut_a(trx->dict_operation_lock_mode == 0);
+  trx->dict_operation_lock_mode = RW_S_LATCH;
+  dict_sys.freeze();
 }
 
 /*********************************************************************//**
@@ -2119,13 +2074,10 @@ row_mysql_unfreeze_data_dictionary(
 /*===============================*/
 	trx_t*	trx)	/*!< in/out: transaction */
 {
-	ut_ad(lock_trx_has_sys_table_locks(trx) == NULL);
-
-	ut_a(trx->dict_operation_lock_mode == RW_S_LATCH);
-
-	rw_lock_s_unlock(&dict_sys.latch);
-
-	trx->dict_operation_lock_mode = 0;
+  ut_ad(!lock_trx_has_sys_table_locks(trx));
+  ut_ad(trx->dict_operation_lock_mode == RW_S_LATCH);
+  dict_sys.unfreeze();
+  trx->dict_operation_lock_mode = 0;
 }
 
 /** Write query start time as SQL field data to a buffer. Needed by InnoDB.
@@ -2230,14 +2182,14 @@ row_update_cascade_for_mysql(
 
 	if (table->versioned()) {
 		if (node->is_delete == PLAIN_DELETE) {
-			node->make_versioned_delete(trx);
-		} else if (node->update->affects_versioned()) {
+                  node->vers_make_delete(trx);
+                } else if (node->update->affects_versioned()) {
 			dberr_t err = row_update_vers_insert(thr, node);
 			if (err != DB_SUCCESS) {
 				return err;
 			}
-			node->make_versioned_update(trx);
-		}
+                        node->vers_make_update(trx);
+                }
 	}
 
 	for (;;) {
@@ -2272,8 +2224,7 @@ row_update_cascade_for_mysql(
 			bool stats;
 
 			if (node->is_delete == PLAIN_DELETE) {
-				/* Not protected by
-				dict_table_stats_lock() for
+				/* Not protected by dict_sys.mutex for
 				performance reasons, we would rather
 				get garbage in stat_n_rows (which is
 				just an estimate anyway) than
@@ -2312,8 +2263,7 @@ row_mysql_lock_data_dictionary_func(
 	const char*	file,	/*!< in: file name */
 	unsigned	line)	/*!< in: line number */
 {
-	ut_a(trx->dict_operation_lock_mode == 0
-	     || trx->dict_operation_lock_mode == RW_X_LATCH);
+	ut_ad(trx->dict_operation_lock_mode == 0);
 	dict_sys.lock(file, line);
 	trx->dict_operation_lock_mode = RW_X_LATCH;
 }
@@ -2326,7 +2276,7 @@ row_mysql_unlock_data_dictionary(
 	trx_t*	trx)	/*!< in/out: transaction */
 {
 	ut_ad(lock_trx_has_sys_table_locks(trx) == NULL);
-	ut_a(trx->dict_operation_lock_mode == RW_X_LATCH);
+	ut_ad(trx->dict_operation_lock_mode == RW_X_LATCH);
 	trx->dict_operation_lock_mode = 0;
 	dict_sys.unlock();
 }
@@ -2401,21 +2351,6 @@ err_exit:
 	que_run_threads(thr);
 
 	err = trx->error_state;
-
-	/* Update SYS_TABLESPACES and SYS_DATAFILES if a new file-per-table
-	tablespace was created. */
-	if (err == DB_SUCCESS && dict_table_is_file_per_table(table)) {
-		err = dict_replace_tablespace_in_dictionary(
-			table->space_id, table->name.m_name,
-			table->space->flags,
-			table->space->chain.start->name, trx);
-
-		if (err != DB_SUCCESS) {
-
-			/* We must delete the link file. */
-			RemoteDatafile::delete_link_file(table->name.m_name);
-		}
-	}
 
 	switch (err) {
 	case DB_SUCCESS:
@@ -2606,7 +2541,7 @@ row_drop_table_for_mysql_in_background(
 
 	trx_commit_for_mysql(trx);
 
-	trx_free(trx);
+	trx->free();
 
 	return(error);
 }
@@ -2790,7 +2725,7 @@ row_mysql_drop_garbage_tables()
 	btr_pcur_close(&pcur);
 	mtr.commit();
 	row_mysql_unlock_data_dictionary(trx);
-	trx_free(trx);
+	trx->free();
 	mem_heap_free(heap);
 }
 
@@ -3429,8 +3364,7 @@ row_drop_table_for_mysql(
 		dict_stats_recalc_pool_del(table);
 		dict_stats_defrag_pool_del(table, NULL);
 		if (btr_defragment_active) {
-			/* During fts_drop_orphaned_tables() in
-			recv_recovery_rollback_active() the
+			/* During fts_drop_orphaned_tables() the
 			btr_defragment_mutex has not yet been
 			initialized by btr_defragment_init(). */
 			btr_defragment_remove_table(table);
@@ -3593,13 +3527,13 @@ defer:
 	for (dict_index_t* index = dict_table_get_first_index(table);
 	     index != NULL;
 	     index = dict_table_get_next_index(index)) {
-		rw_lock_x_lock(dict_index_get_lock(index));
+		index->lock.x_lock(SRW_LOCK_CALL);
 		/* Save the page numbers so that we can restore them
 		if the operation fails. */
 		*page_no++ = index->page;
 		/* Mark the index unusable. */
 		index->page = FIL_NULL;
-		rw_lock_x_unlock(dict_index_get_lock(index));
+		index->lock.x_unlock();
 	}
 
 	/* Deleting a row from SYS_INDEXES table will invoke
@@ -3693,23 +3627,6 @@ do_drop:
 			"DELETE FROM SYS_TABLES WHERE NAME=:name;\n"
 
 			"END;\n", FALSE, trx) : err;
-
-		if (err == DB_SUCCESS && table->space
-		    && dict_table_get_low("SYS_TABLESPACES")
-		    && dict_table_get_low("SYS_DATAFILES")) {
-			info = pars_info_create();
-			pars_info_add_int4_literal(info, "id",
-						   lint(table->space_id));
-			err = que_eval_sql(
-				info,
-				"PROCEDURE DROP_SPACE_PROC () IS\n"
-				"BEGIN\n"
-				"DELETE FROM SYS_TABLESPACES\n"
-				"WHERE SPACE = :id;\n"
-				"DELETE FROM SYS_DATAFILES\n"
-				"WHERE SPACE = :id;\n"
-				"END;\n", FALSE, trx);
-		}
 	}
 
 	switch (err) {
@@ -3796,10 +3713,10 @@ do_drop:
 		for (dict_index_t* index = dict_table_get_first_index(table);
 		     index != NULL;
 		     index = dict_table_get_next_index(index)) {
-			rw_lock_x_lock(dict_index_get_lock(index));
+			index->lock.x_lock(SRW_LOCK_CALL);
 			ut_a(index->page == FIL_NULL);
 			index->page = *page_no++;
-			rw_lock_x_unlock(dict_index_get_lock(index));
+			index->lock.x_unlock();
 		}
 	}
 
@@ -3844,8 +3761,6 @@ funct_exit_all_freed:
 	}
 
 	trx->op_info = "";
-
-	srv_wake_master_thread();
 
 	DBUG_RETURN(err);
 }
@@ -3965,9 +3880,21 @@ loop:
 		avoid accessing dropped fts aux tables in information
 		scheam when parent table still exists.
 		Note: Drop parent table will drop fts aux tables. */
-		char*	parent_table_name;
-		parent_table_name = fts_get_parent_table_name(
-				table_name, strlen(table_name));
+		char*		parent_table_name = NULL;
+		table_id_t	table_id;
+		index_id_t	index_id;
+
+		if (fts_check_aux_table(
+				table_name, &table_id, &index_id)) {
+			dict_table_t* parent_table = dict_table_open_on_id(
+					table_id, TRUE, DICT_TABLE_OP_NORMAL);
+			if (parent_table != NULL) {
+				parent_table_name = mem_strdupl(
+					parent_table->name.m_name,
+					strlen(parent_table->name.m_name));
+				dict_table_close(parent_table, TRUE, FALSE);
+			}
+		}
 
 		if (parent_table_name != NULL) {
 			ut_free(table_name);
@@ -4315,38 +4242,6 @@ row_rename_table_for_mysql(
 			   "END;\n"
 			   , FALSE, trx);
 
-	/* SYS_TABLESPACES and SYS_DATAFILES need to be updated if
-	the table is in a single-table tablespace. */
-	if (err != DB_SUCCESS || !dict_table_is_file_per_table(table)) {
-	} else if (table->space) {
-		/* If old path and new path are the same means tablename
-		has not changed and only the database name holding the table
-		has changed so we need to make the complete filepath again. */
-		char*	new_path = dict_tables_have_same_db(old_name, new_name)
-			? os_file_make_new_pathname(
-				table->space->chain.start->name, new_name)
-			: fil_make_filepath(NULL, new_name, IBD, false);
-
-		info = pars_info_create();
-
-		pars_info_add_str_literal(info, "new_table_name", new_name);
-		pars_info_add_str_literal(info, "new_path_name", new_path);
-		pars_info_add_int4_literal(info, "space_id", table->space_id);
-
-		err = que_eval_sql(info,
-				   "PROCEDURE RENAME_SPACE () IS\n"
-				   "BEGIN\n"
-				   "UPDATE SYS_TABLESPACES"
-				   " SET NAME = :new_table_name\n"
-				   " WHERE SPACE = :space_id;\n"
-				   "UPDATE SYS_DATAFILES"
-				   " SET PATH = :new_path_name\n"
-				   " WHERE SPACE = :space_id;\n"
-				   "END;\n"
-				   , FALSE, trx);
-
-		ut_free(new_path);
-	}
 	if (err != DB_SUCCESS) {
 		goto end;
 	}
@@ -4559,12 +4454,20 @@ end:
 		if (err != DB_SUCCESS) {
 
 			if (old_is_tmp) {
-				ib::error() << "In ALTER TABLE "
+				/* In case of copy alter, ignore the
+				loading of foreign key constraint
+				when foreign_key_check is disabled */
+				ib::error_or_warn(trx->check_foreigns)
+					<< "In ALTER TABLE "
 					<< ut_get_name(trx, new_name)
 					<< " has or is referenced in foreign"
 					" key constraints which are not"
 					" compatible with the new table"
 					" definition.";
+				if (!trx->check_foreigns) {
+					err = DB_SUCCESS;
+					goto funct_exit;
+				}
 			} else {
 				ib::error() << "In RENAME TABLE table "
 					<< ut_get_name(trx, new_name)
@@ -4634,7 +4537,7 @@ funct_exit:
 
 		trx_bg->dict_operation_lock_mode = 0;
 		trx_commit_for_mysql(trx_bg);
-		trx_free(trx_bg);
+		trx_bg->free();
 	}
 
 	if (table != NULL) {

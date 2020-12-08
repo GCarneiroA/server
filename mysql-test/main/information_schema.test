@@ -17,6 +17,8 @@
 --source include/default_optimizer_switch.inc
 --source include/default_charset.inc
 
+--source include/have_sequence.inc
+
 set global sql_mode="";
 set local sql_mode="";
 
@@ -1919,4 +1921,89 @@ SELECT SCHEMA_NAME from information_schema.schemata where schema_name=REPEAT('a'
 
 --echo #
 --echo # End of 10.1 tests
+--echo #
+
+--echo #
+--echo # MDEV-14836: Assertion `m_status == DA_ERROR' failed in
+--echo # Diagnostics_area::sql_errno upon query from I_S with LIMIT ROWS EXAMINED
+--echo #
+
+SELECT * FROM seq_1_to_100 LIMIT ROWS EXAMINED 10;
+
+--echo #
+--echo # End of 10.2 Test
+--echo #
+
+--echo #
+--echo # MDEV-21201:No records produced in information_schema query,
+--echo # depending on projection
+--echo #
+
+create table t (i int, constraint a check (i > 0));
+
+--disable_warnings
+--sorted_result
+select
+  tc.TABLE_SCHEMA,
+  tc.TABLE_NAME,
+  cc.CONSTRAINT_NAME,
+  cc.CHECK_CLAUSE
+from information_schema.TABLE_CONSTRAINTS tc
+  join information_schema.CHECK_CONSTRAINTS cc
+    using (CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME)
+;
+--sorted_result
+select
+  tc.TABLE_SCHEMA,
+  tc.TABLE_NAME,
+  cc.CONSTRAINT_NAME,
+  cc.CHECK_CLAUSE
+from information_schema.CHECK_CONSTRAINTS cc
+  join information_schema.TABLE_CONSTRAINTS tc
+    using (CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME)
+;
+--sorted_result
+select
+  tc.TABLE_SCHEMA,
+  tc.TABLE_NAME,
+  cc.CONSTRAINT_NAME,
+  cc.CHECK_CLAUSE
+from information_schema.TABLE_CONSTRAINTS tc
+  NATURAL join information_schema.CHECK_CONSTRAINTS cc
+;
+--sorted_result
+select
+  tc.TABLE_SCHEMA,
+  tc.TABLE_NAME,
+  cc.CONSTRAINT_NAME,
+  cc.CHECK_CLAUSE
+from information_schema.CHECK_CONSTRAINTS cc
+  NATURAL join information_schema.TABLE_CONSTRAINTS tc
+;
+--sorted_result
+select
+  tc.TABLE_SCHEMA,
+  tc.TABLE_NAME,
+  cc.CONSTRAINT_NAME,
+  cc.CHECK_CLAUSE,
+  tc.CONSTRAINT_CATALOG,
+  tc.CONSTRAINT_SCHEMA
+from information_schema.TABLE_CONSTRAINTS tc
+  join information_schema.CHECK_CONSTRAINTS cc
+    using (CONSTRAINT_CATALOG, CONSTRAINT_SCHEMA, TABLE_NAME, CONSTRAINT_NAME)
+;
+--enable_warnings
+
+drop table t;
+
+--echo #
+--echo # MDEV-24230 subquery on information_schema fails with error message
+--echo #
+create table t1 (n int);
+create table t2 (n int);
+insert into t1 set n = (select table_rows from information_schema.tables where table_name='t2');
+drop table t1, t2;
+
+--echo #
+--echo # End of 10.3 tests
 --echo #

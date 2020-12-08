@@ -400,6 +400,9 @@ bool sp_create_assignment_lex(THD *thd, const char *pos)
     new_lex->sphead->m_tmp_query= pos;
     return thd->lex->sphead->reset_lex(thd, new_lex);
   }
+  else
+    if (thd->lex->main_select_push(false))
+      return true;
   return false;
 }
 
@@ -491,6 +494,8 @@ bool sp_create_assignment_instr(THD *thd, bool no_lookahead,
     /* Copy option_type to outer lex in case it has changed. */
     thd->lex->option_type= inner_option_type;
   }
+  else
+    lex->pop_select();
   return false;
 }
 
@@ -769,6 +774,7 @@ void
 st_parsing_options::reset()
 {
   allows_variable= TRUE;
+  lookup_keywords_after_qualifier= false;
 }
 
 
@@ -2144,7 +2150,10 @@ int Lex_input_stream::lex_one_token(YYSTYPE *yylval, THD *thd)
       yylval->lex_str.str= (char*) get_ptr();
       yylval->lex_str.length= 1;
       c= yyGet();                          // should be '.'
-      next_state= MY_LEX_IDENT_START;      // Next is ident (not keyword)
+      if (lex->parsing_options.lookup_keywords_after_qualifier)
+        next_state= MY_LEX_IDENT_OR_KEYWORD;
+      else
+        next_state= MY_LEX_IDENT_START;    // Next is ident (not keyword)
       if (!ident_map[(uchar) yyPeek()])    // Probably ` or "
         next_state= MY_LEX_START;
       return((int) c);
@@ -2808,8 +2817,17 @@ int Lex_input_stream::scan_ident_delimited(THD *thd,
   uchar c;
   DBUG_ASSERT(m_ptr == m_tok_start + 1);
 
-  while ((c= yyGet()))
+  for ( ; ; )
   {
+    if (!(c= yyGet()))
+    {
+      /*
+        End-of-query or straight 0x00 inside a delimited identifier.
+        Return the quote character, to have the parser fail on syntax error.
+      */
+      m_ptr= (char *) m_tok_start + 1;
+      return quote_char;
+    }
     int var_length= cs->charlen(get_ptr() - 1, get_end_of_query());
     if (var_length == 1)
     {
@@ -2941,11 +2959,13 @@ void st_select_lex::init_query()
   n_sum_items= 0;
   n_child_sum_items= 0;
   hidden_bit_fields= 0;
+  fields_in_window_functions= 0;
   subquery_in_having= explicit_limit= 0;
   is_item_list_lookup= 0;
   changed_elements= 0;
   first_natural_join_processing= 1;
   first_cond_optimization= 1;
+  is_service_select= 0;
   parsing_place= NO_MATTER;
   save_parsing_place= NO_MATTER;
   exclude_from_table_unique_test= no_wrap_view_item= FALSE;
@@ -3503,7 +3523,8 @@ bool st_select_lex::setup_ref_array(THD *thd, uint order_group_num)
                        select_n_having_items +
                        select_n_where_fields +
                        order_group_num +
-                       hidden_bit_fields) * 5;
+                       hidden_bit_fields +
+                       fields_in_window_functions) * 5;
   if (!ref_pointer_array.is_null())
   {
     /*
@@ -3546,8 +3567,10 @@ void LEX::print(String *str, enum_query_type query_type)
     str->append(STRING_WITH_LEN("UPDATE "));
     if (ignore)
       str->append(STRING_WITH_LEN("IGNORE "));
-    // table name
-    str->append(query_tables->alias);
+    // table name. If the query was using a view, we need
+    // the underlying table name, not the view name
+    TABLE_LIST *base_tbl= query_tables->table->pos_in_table_list;
+    base_tbl->print(thd, table_map(0), str, query_type);
     str->append(STRING_WITH_LEN(" SET "));
     // print item assignments
     List_iterator<Item> it(sel->item_list);
@@ -3564,6 +3587,41 @@ void LEX::print(String *str, enum_query_type query_type)
       str->append(STRING_WITH_LEN("="));
       value->print(str, query_type);
     }
+
+    if (sel->where)
+    {
+      str->append(STRING_WITH_LEN(" WHERE "));
+      sel->where->print(str, query_type);
+    }
+
+    if (sel->order_list.elements)
+    {
+      str->append(STRING_WITH_LEN(" ORDER BY "));
+      for (ORDER *ord= sel->order_list.first; ord; ord= ord->next)
+      {
+        if (ord != sel->order_list.first)
+          str->append(STRING_WITH_LEN(", "));
+        (*ord->item)->print(str, query_type);
+      }
+    }
+    if (sel->select_limit)
+    {
+      str->append(STRING_WITH_LEN(" LIMIT "));
+      sel->select_limit->print(str, query_type);
+    }
+  }
+  else if (sql_command == SQLCOM_DELETE)
+  {
+    SELECT_LEX *sel= first_select_lex();
+    str->append(STRING_WITH_LEN("DELETE "));
+    if (ignore)
+      str->append(STRING_WITH_LEN("IGNORE "));
+
+    str->append(STRING_WITH_LEN("FROM "));
+    // table name. If the query was using a view, we need
+    // the underlying table name, not the view name
+    TABLE_LIST *base_tbl= query_tables->table->pos_in_table_list;
+    base_tbl->print(thd, table_map(0), str, query_type);
 
     if (sel->where)
     {
@@ -3976,21 +4034,21 @@ bool LEX::can_not_use_merged()
   }
 }
 
-/*
-  Detect that we need only table structure of derived table/view
+/**
+  Detect that we need only table structure of derived table/view.
 
-  SYNOPSIS
-    only_view_structure()
+  Also used by I_S tables (@see create_schema_table) to detect that
+  they need a full table structure and cannot optimize unused columns away
 
-  RETURN
-    TRUE yes, we need only structure
-    FALSE no, we need data
+  @retval TRUE yes, we need only structure
+  @retval FALSE no, we need data
 */
 
 bool LEX::only_view_structure()
 {
   switch (sql_command) {
   case SQLCOM_SHOW_CREATE:
+  case SQLCOM_CHECKSUM:
   case SQLCOM_SHOW_TABLES:
   case SQLCOM_SHOW_FIELDS:
   case SQLCOM_REVOKE_ALL:
@@ -3998,6 +4056,8 @@ bool LEX::only_view_structure()
   case SQLCOM_GRANT:
   case SQLCOM_CREATE_VIEW:
     return TRUE;
+  case SQLCOM_CREATE_TABLE:
+    return create_info.like();
   default:
     return FALSE;
   }
@@ -4740,7 +4800,7 @@ bool st_select_lex::optimize_unflattened_subqueries(bool const_only)
       }
       if (subquery_predicate->substype() == Item_subselect::IN_SUBS)
       {
-        Item_in_subselect *in_subs= (Item_in_subselect*) subquery_predicate;
+        Item_in_subselect *in_subs= subquery_predicate->get_IN_subquery();
         if (in_subs->is_jtbm_merged)
           continue;
       }
@@ -4789,7 +4849,8 @@ bool st_select_lex::optimize_unflattened_subqueries(bool const_only)
           sl->options|= SELECT_DESCRIBE;
           inner_join->select_options|= SELECT_DESCRIBE;
         }
-        res= inner_join->optimize();
+        if ((res= inner_join->optimize()))
+          return TRUE;
         if (!inner_join->cleaned)
           sl->update_used_tables();
         sl->update_correlated_cache();
@@ -5167,7 +5228,7 @@ void SELECT_LEX::update_used_tables()
     */
     if (tl->jtbm_subselect)
     {
-      Item *left_expr= tl->jtbm_subselect->left_expr;
+      Item *left_expr= tl->jtbm_subselect->left_exp();
       left_expr->walk(&Item::update_table_bitmaps_processor, FALSE, NULL);
     }
 
@@ -5324,7 +5385,7 @@ void st_select_lex::set_explain_type(bool on_the_fly)
   if ((parent_item= master_unit()->item) &&
       parent_item->substype() == Item_subselect::IN_SUBS)
   {
-    Item_in_subselect *in_subs= (Item_in_subselect*)parent_item;
+    Item_in_subselect *in_subs= parent_item->get_IN_subquery();
     /*
       Surprisingly, in_subs->is_set_strategy() can return FALSE here,
       even for the last invocation of this function for the select.
@@ -5406,12 +5467,14 @@ void st_select_lex::set_explain_type(bool on_the_fly)
               /*
                 pos_in_table_list=NULL for e.g. post-join aggregation JOIN_TABs.
               */
-              if (tab->table && tab->table->pos_in_table_list &&
-                  tab->table->pos_in_table_list->with &&
-                  tab->table->pos_in_table_list->with->is_recursive)
+              if (!tab->table);
+              else if (const TABLE_LIST *pos= tab->table->pos_in_table_list)
               {
-                uses_cte= true;
-                break;
+                if (pos->with && pos->with->is_recursive)
+                {
+                  uses_cte= true;
+                  break;
+                }
               }
             }
             if (uses_cte)
@@ -5613,9 +5676,10 @@ bool st_select_lex::is_merged_child_of(st_select_lex *ancestor)
        sl=sl->outer_select())
   {
     Item *subs= sl->master_unit()->item;
-    if (subs && subs->type() == Item::SUBSELECT_ITEM && 
+    Item_in_subselect *in_subs= (subs ? subs->get_IN_subquery() : NULL);
+    if (in_subs &&
         ((Item_subselect*)subs)->substype() == Item_subselect::IN_SUBS &&
-        ((Item_in_subselect*)subs)->test_strategy(SUBS_SEMI_JOIN))
+        in_subs->test_strategy(SUBS_SEMI_JOIN))
     {
       continue;
     }
@@ -6784,6 +6848,7 @@ bool LEX::sp_for_loop_cursor_declarations(THD *thd,
   LEX_CSTRING name;
   uint coffs, param_count= 0;
   const sp_pcursor *pcursor;
+  DBUG_ENTER("LEX::sp_for_loop_cursor_declarations");
 
   if ((item_splocal= item->get_item_splocal()))
     name= item_splocal->m_name;
@@ -6815,23 +6880,23 @@ bool LEX::sp_for_loop_cursor_declarations(THD *thd,
   else
   {
     thd->parse_error();
-    return true;
+    DBUG_RETURN(true);
   }
   if (unlikely(!(pcursor= spcont->find_cursor_with_error(&name, &coffs,
                                                          false)) ||
                pcursor->check_param_count_with_error(param_count)))
-    return true;
+    DBUG_RETURN(true);
 
   if (!(loop->m_index= sp_add_for_loop_cursor_variable(thd, index,
                                                        pcursor, coffs,
                                                        bounds.m_index,
                                                        item_func_sp)))
-    return true;
+    DBUG_RETURN(true);
   loop->m_target_bound= NULL;
   loop->m_direction= bounds.m_direction;
   loop->m_cursor_offset= coffs;
   loop->m_implicit_cursor= bounds.m_implicit_cursor;
-  return false;
+  DBUG_RETURN(false);
 }
 
 
@@ -8185,6 +8250,7 @@ Item *LEX::create_item_ident_sp(THD *thd, Lex_ident_sys_st *name,
 
   const Sp_rcontext_handler *rh;
   sp_variable *spv;
+  uint unused_off;
   DBUG_ASSERT(spcont);
   DBUG_ASSERT(sphead);
   if ((spv= find_variable(name, &rh)))
@@ -8221,6 +8287,15 @@ Item *LEX::create_item_ident_sp(THD *thd, Lex_ident_sys_st *name,
       return new (thd->mem_root) Item_func_sqlcode(thd);
     if (lex_string_eq(name, STRING_WITH_LEN("SQLERRM")))
       return new (thd->mem_root) Item_func_sqlerrm(thd);
+  }
+
+  if (fields_are_impossible() &&
+      (current_select->parsing_place != FOR_LOOP_BOUND ||
+       spcont->find_cursor(name, &unused_off, false) == NULL))
+  {
+    // we are out of SELECT or FOR so it is syntax error
+    my_error(ER_SP_UNDECLARED_VAR, MYF(0), name->str);
+    return NULL;
   }
 
   if (current_select->parsing_place == FOR_LOOP_BOUND)
@@ -9551,11 +9626,13 @@ void st_select_lex::add_statistics(SELECT_LEX_UNIT *unit)
 }
 
 
-bool LEX::main_select_push()
+bool LEX::main_select_push(bool service)
 {
   DBUG_ENTER("LEX::main_select_push");
+  DBUG_PRINT("info", ("service: %u", service));
   current_select_number= 1;
   builtin_select.select_number= 1;
+  builtin_select.is_service_select= service;
   if (push_select(&builtin_select))
     DBUG_RETURN(TRUE);
   DBUG_RETURN(FALSE);
@@ -9712,7 +9789,8 @@ Item *LEX::create_item_query_expression(THD *thd,
 
   // Add the subtree of subquery to the current SELECT_LEX
   SELECT_LEX *curr_sel= select_stack_head();
-  DBUG_ASSERT(current_select == curr_sel);
+  DBUG_ASSERT(current_select == curr_sel ||
+              (curr_sel == NULL && current_select == &builtin_select));
   if (!curr_sel)
   {
     curr_sel= &builtin_select;
@@ -9955,7 +10033,8 @@ SELECT_LEX *LEX::parsed_subselect(SELECT_LEX_UNIT *unit)
 
   // Add the subtree of subquery to the current SELECT_LEX
   SELECT_LEX *curr_sel= select_stack_head();
-  DBUG_ASSERT(current_select == curr_sel);
+  DBUG_ASSERT(current_select == curr_sel ||
+              (curr_sel == NULL && current_select == &builtin_select));
   if (curr_sel)
   {
     curr_sel->register_unit(unit, &curr_sel->context);
@@ -10031,7 +10110,8 @@ TABLE_LIST *LEX::parsed_derived_table(SELECT_LEX_UNIT *unit,
 
   // Add the subtree of subquery to the current SELECT_LEX
   SELECT_LEX *curr_sel= select_stack_head();
-  DBUG_ASSERT(current_select == curr_sel);
+  DBUG_ASSERT(current_select == curr_sel ||
+              (curr_sel == NULL && current_select == &builtin_select));
 
   Table_ident *ti= new (thd->mem_root) Table_ident(unit);
   if (ti == NULL)
@@ -10168,7 +10248,8 @@ bool LEX::new_sp_instr_stmt(THD *thd,
   qbuff.length= prefix.length + suffix.length;
   if (!(qbuff.str= (char*) alloc_root(thd->mem_root, qbuff.length + 1)))
     return true;
-  memcpy(qbuff.str, prefix.str, prefix.length);
+  if (prefix.length)
+    memcpy(qbuff.str, prefix.str, prefix.length);
   strmake(qbuff.str + prefix.length, suffix.str, suffix.length);
   i->m_query= qbuff;
   return sphead->add_instr(i);
@@ -10235,7 +10316,7 @@ bool LEX::sp_proc_stmt_statement_finalize(THD *thd, bool no_lookahead)
     It is done by transformer.
 
     The extracted condition is saved in cond_pushed_into_where of this select.
-    cond can remain un empty after the extraction of the condition that can be
+    COND can remain not empty after the extraction of the conditions that can be
     pushed into WHERE. It is saved in remaining_cond.
 
   @note
@@ -11428,4 +11509,26 @@ bool LEX::sp_create_set_password_instr(THD *thd,
   if (sphead)
     sphead->m_flags|= sp_head::HAS_SET_AUTOCOMMIT_STMT;
   return sp_create_assignment_instr(thd, no_lookahead);
+}
+
+
+bool LEX::map_data_type(const Lex_ident_sys_st &schema_name,
+                        Lex_field_type_st *type) const
+{
+  const Schema *schema= schema_name.str ?
+                        Schema::find_by_name(schema_name) :
+                        Schema::find_implied(thd);
+  if (!schema)
+  {
+    char buf[128];
+    const Name type_name= type->type_handler()->name();
+    my_snprintf(buf, sizeof(buf), "%.*s.%.*s",
+                (int) schema_name.length, schema_name.str,
+                (int) type_name.length(), type_name.ptr());
+    my_error(ER_UNKNOWN_DATA_TYPE, MYF(0), buf);
+    return true;
+  }
+  const Type_handler *mapped= schema->map_data_type(thd, type->type_handler());
+  type->set_handler(mapped);
+  return false;
 }

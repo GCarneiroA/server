@@ -109,18 +109,6 @@ innobase_convert_name(
 	THD*		thd);	/*!< in: MySQL connection thread, or NULL */
 
 /******************************************************************//**
-Returns true if the thread is the replication thread on the slave
-server. Used in srv_conc_enter_innodb() to determine if the thread
-should be allowed to enter InnoDB - the replication thread is treated
-differently than other threads. Also used in
-srv_conc_force_exit_innodb().
-@return true if thd is the replication thread */
-ibool
-thd_is_replication_slave_thread(
-/*============================*/
-	THD*	thd);	/*!< in: thread handle */
-
-/******************************************************************//**
 Returns true if the transaction this thread is processing has edited
 non-transactional tables. Used by the deadlock detector when deciding
 which transaction to rollback in case of a deadlock - we try to avoid
@@ -194,14 +182,6 @@ innobase_basename(
 	const char*	path_name);
 
 /******************************************************************//**
-Returns true if the thread is executing a SELECT statement.
-@return true if thd is executing SELECT */
-ibool
-thd_is_select(
-/*==========*/
-	const THD*	thd);	/*!< in: thread handle */
-
-/******************************************************************//**
 Converts an identifier to a table name. */
 void
 innobase_convert_from_table_id(
@@ -229,9 +209,7 @@ innobase_casedn_str(
 	char*	a);	/*!< in/out: string to put in lower case */
 
 #ifdef WITH_WSREP
-int
-wsrep_innobase_kill_one_trx(THD *bf_thd, trx_t *victim_trx,
-			    bool signal);
+int wsrep_innobase_kill_one_trx(THD *bf_thd, trx_t *victim_trx, bool signal);
 ulint wsrep_innobase_mysql_sort(int mysql_type, uint charset_number,
                              unsigned char* str, ulint str_length,
                              unsigned int buf_length);

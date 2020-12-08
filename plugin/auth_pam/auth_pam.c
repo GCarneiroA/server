@@ -1,5 +1,5 @@
 /*
-   Copyright (c) 2011, 2019, MariaDB Corporation.
+   Copyright (c) 2011, 2020, MariaDB Corporation.
 
    This program is free software; you can redistribute it and/or modify
    it under the terms of the GNU General Public License as published by
@@ -15,6 +15,7 @@
    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02111-1301 USA */
 
 
+#include <config_auth_pam.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/types.h>
@@ -36,12 +37,20 @@ static char *opt_plugin_dir; /* To be dynamically linked. */
 static const char *tool_name= "auth_pam_tool_dir/auth_pam_tool";
 static const int tool_name_len= 31;
 
+/*
+  sleep_limit is now 5 meaning up to 1 second sleep.
+  each step means 10 times longer sleep, so 6 would mean 10 seconds.
+*/
+static const unsigned int sleep_limit= 5;
+
 static int pam_auth(MYSQL_PLUGIN_VIO *vio, MYSQL_SERVER_AUTH_INFO *info)
 {
   int p_to_c[2], c_to_p[2]; /* Parent-to-child and child-to-parent pipes. */
   pid_t proc_id;
   int result= CR_ERROR, pkt_len= 0;
   unsigned char field, *pkt;
+  unsigned int n_sleep= 0;
+  useconds_t sleep_time= 100;
 
   PAM_DEBUG((stderr, "PAM: opening pipes.\n"));
   if (pipe(p_to_c) < 0 || pipe(c_to_p) < 0)
@@ -190,7 +199,24 @@ static int pam_auth(MYSQL_PLUGIN_VIO *vio, MYSQL_SERVER_AUTH_INFO *info)
 error_ret:
   close(p_to_c[1]);
   close(c_to_p[0]);
-  waitpid(proc_id, NULL, WNOHANG);
+  while (waitpid(proc_id, NULL, WNOHANG) != (int) proc_id)
+  {
+    if (n_sleep++ == sleep_limit)
+    {
+      /*
+        The auth_pam_tool application doesn't terminate.
+        Means something wrong happened there like pam_xxx.so hanged.
+      */
+      kill(proc_id, SIGKILL);
+      sleep_time= 1000000; /* 1 second wait should be enough. */
+      PAM_DEBUG((stderr, "PAM: auth_pam_tool doesn't terminate,"
+                         " have to kill it.\n"));
+    }
+    else if (n_sleep > sleep_limit)
+      break;
+    usleep(sleep_time);
+    sleep_time*= 10;
+  }
 
   PAM_DEBUG((stderr, "PAM: auth result %d.\n", result));
   return result;

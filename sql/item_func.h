@@ -450,6 +450,25 @@ public:
     :Item_func(thd, item), Type_handler_hybrid_field_type(item) { }
   const Type_handler *type_handler() const
   { return Type_handler_hybrid_field_type::type_handler(); }
+  void fix_length_and_dec_long_or_longlong(uint char_length, bool unsigned_arg)
+  {
+    collation= DTCollation_numeric();
+    unsigned_flag= unsigned_arg;
+    max_length= char_length;
+    set_handler(Type_handler::type_handler_long_or_longlong(char_length,
+                                                            unsigned_arg));
+  }
+  void fix_length_and_dec_ulong_or_ulonglong_by_nbits(uint nbits)
+  {
+    uint digits= Type_handler_bit::Bit_decimal_notation_int_digits_by_nbits(nbits);
+    collation= DTCollation_numeric();
+    unsigned_flag= true;
+    max_length= digits;
+    if (nbits > 32)
+      set_handler(&type_handler_ulonglong);
+    else
+      set_handler(&type_handler_ulong);
+  }
 };
 
 
@@ -466,6 +485,12 @@ public:
     virtual longlong val_int(Item_handled_func *) const= 0;
     virtual my_decimal *val_decimal(Item_handled_func *, my_decimal *) const= 0;
     virtual bool get_date(THD *thd, Item_handled_func *, MYSQL_TIME *, date_mode_t fuzzydate) const= 0;
+    virtual bool val_native(THD *thd, Item_handled_func *, Native *to) const
+    {
+      DBUG_ASSERT(0);
+      to->length(0);
+      return true;
+    }
     virtual const Type_handler *
       return_type_handler(const Item_handled_func *item) const= 0;
     virtual const Type_handler *
@@ -611,6 +636,10 @@ public:
     String *val_str_ascii(Item_handled_func *item, String *to) const
     {
       return Time(item).to_string(to, item->decimals);
+    }
+    bool val_native(THD *thd, Item_handled_func *item, Native *to) const
+    {
+      return Time(thd, item).to_native(to, item->decimals);
     }
   };
 
@@ -768,6 +797,10 @@ public:
   bool get_date(THD *thd, MYSQL_TIME *to, date_mode_t fuzzydate)
   {
     return m_func_handler->get_date(thd, this, to, fuzzydate);
+  }
+  bool val_native(THD *thd, Native *to)
+  {
+    return m_func_handler->val_native(thd, this, to);
   }
 };
 
@@ -1813,13 +1846,33 @@ public:
 };
 
 
-class Item_func_int_val :public Item_func_num1
+class Item_func_int_val :public Item_func_hybrid_field_type
 {
 public:
-  Item_func_int_val(THD *thd, Item *a): Item_func_num1(thd, a) {}
+  Item_func_int_val(THD *thd, Item *a): Item_func_hybrid_field_type(thd, a) {}
+  bool check_partition_func_processor(void *int_arg) { return FALSE; }
+  bool check_vcol_func_processor(void *arg) { return FALSE; }
+  virtual decimal_round_mode round_mode() const= 0;
   void fix_length_and_dec_double();
   void fix_length_and_dec_int_or_decimal();
+  void fix_length_and_dec_time()
+  {
+    fix_attributes_time(0);
+    set_handler(&type_handler_time2);
+  }
+  void fix_length_and_dec_datetime()
+  {
+    fix_attributes_datetime(0);
+    set_handler(&type_handler_datetime2);
+    maybe_null= true; // E.g. CEILING(TIMESTAMP'0000-01-01 23:59:59.9')
+  }
   bool fix_length_and_dec();
+  String *str_op(String *str) { DBUG_ASSERT(0); return 0; }
+  bool native_op(THD *thd, Native *to)
+  {
+    DBUG_ASSERT(0);
+    return true;
+  }
 };
 
 
@@ -1828,9 +1881,12 @@ class Item_func_ceiling :public Item_func_int_val
 public:
   Item_func_ceiling(THD *thd, Item *a): Item_func_int_val(thd, a) {}
   const char *func_name() const { return "ceiling"; }
+  decimal_round_mode round_mode() const { return CEILING; }
   longlong int_op();
   double real_op();
   my_decimal *decimal_op(my_decimal *);
+  bool date_op(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate);
+  bool time_op(THD *thd, MYSQL_TIME *ltime);
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_func_ceiling>(thd, this); }
 };
@@ -1841,9 +1897,12 @@ class Item_func_floor :public Item_func_int_val
 public:
   Item_func_floor(THD *thd, Item *a): Item_func_int_val(thd, a) {}
   const char *func_name() const { return "floor"; }
+  decimal_round_mode round_mode() const { return FLOOR; }
   longlong int_op();
   double real_op();
   my_decimal *decimal_op(my_decimal *);
+  bool date_op(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate);
+  bool time_op(THD *thd, MYSQL_TIME *ltime);
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_func_floor>(thd, this); }
 };
@@ -1855,6 +1914,7 @@ class Item_func_round :public Item_func_hybrid_field_type
   bool truncate;
   void fix_length_and_dec_decimal(uint decimals_to_set);
   void fix_length_and_dec_double(uint decimals_to_set);
+  bool test_if_length_can_increase();
 public:
   Item_func_round(THD *thd, Item *a, Item *b, bool trunc_arg)
     :Item_func_hybrid_field_type(thd, a, b), truncate(trunc_arg) {}
@@ -1875,14 +1935,21 @@ public:
     return NULL;
   }
   void fix_arg_decimal();
-  void fix_arg_int();
+  void fix_arg_int(const Type_handler *preferred,
+                   const Type_std_attributes *preferred_attributes,
+                   bool use_decimal_on_length_increase);
+  void fix_arg_hex_hybrid();
   void fix_arg_double();
   void fix_arg_time();
   void fix_arg_datetime();
   void fix_arg_temporal(const Type_handler *h, uint int_part_length);
   bool fix_length_and_dec()
   {
-    return args[0]->type_handler()->Item_func_round_fix_length_and_dec(this);
+    /*
+      We don't want to translate ENUM/SET to CHAR here.
+      So let's real_type_handler(), not type_handler().
+    */
+    return args[0]->real_type_handler()->Item_func_round_fix_length_and_dec(this);
   }
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_func_round>(thd, this); }
@@ -1895,6 +1962,7 @@ class Item_func_rand :public Item_real_func
   bool first_eval; // TRUE if val_real() is called 1st time
   bool check_arguments() const
   { return check_argument_types_can_return_int(0, arg_count); }
+  void seed_random (Item * val);
 public:
   Item_func_rand(THD *thd, Item *a):
     Item_real_func(thd, a), rand(0), first_eval(TRUE) {}
@@ -1907,12 +1975,11 @@ public:
   void cleanup() { first_eval= TRUE; Item_real_func::cleanup(); }
   bool check_vcol_func_processor(void *arg)
   {
-    return mark_unsupported_function(func_name(), "()", arg, VCOL_NON_DETERMINISTIC);
+    return mark_unsupported_function(func_name(), "()", arg,
+                                     VCOL_NON_DETERMINISTIC);
   }
   Item *get_copy(THD *thd)
   { return get_item_copy<Item_func_rand>(thd, this); }
-private:
-  void seed_random (Item * val);  
 };
 
 

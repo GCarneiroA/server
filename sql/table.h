@@ -1388,9 +1388,16 @@ public:
   /* number of select if it is derived table */
   uint          derived_select_number;
   /*
-    0 or JOIN_TYPE_{LEFT|RIGHT}. Currently this is only compared to 0.
-    If maybe_null !=0, this table is inner w.r.t. some outer join operation,
-    and null_row may be true.
+    Possible values:
+     - 0 by default
+     - JOIN_TYPE_{LEFT|RIGHT} if the table is inner w.r.t an outer join
+       operation
+     - 1 if the SELECT has mixed_implicit_grouping=1. example:
+       select max(col1), col2 from t1. In this case, the query produces
+       one row with all columns having NULL values.
+
+    Interpetation: If maybe_null!=0, all fields of the table are considered
+    NULLable (and have NULL values when null_row=true)
   */
   uint maybe_null;
   int		current_lock;           /* Type of lock on table */
@@ -1667,6 +1674,7 @@ public:
                                       TABLE *tmp_table,
                                       TMP_TABLE_PARAM *tmp_table_param,
                                       bool with_cleanup);
+  int fix_vcol_exprs(THD *thd);
   Field *find_field_by_name(LEX_CSTRING *str) const;
   bool export_structure(THD *thd, class Row_definition_list *defs);
   bool is_splittable() { return spl_opt_info != NULL; }
@@ -3187,7 +3195,8 @@ inline void mark_as_null_row(TABLE *table)
 {
   table->null_row=1;
   table->status|=STATUS_NULL_ROW;
-  bfill(table->null_flags,table->s->null_bytes,255);
+  if (table->s->null_bytes)
+    bfill(table->null_flags,table->s->null_bytes,255);
 }
 
 bool is_simple_order(ORDER *order);

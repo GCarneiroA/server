@@ -525,7 +525,7 @@ Item *Item_func::transform(THD *thd, Item_transformer transformer, uchar *argume
   callback functions.
 
     First the function applies the analyzer to the root node of
-    the Item_func object. Then if the analizer succeeeds (returns TRUE)
+    the Item_func object. Then if the analyzer succeeds (returns TRUE)
     the function recursively applies the compile method to each argument
     of the Item_func node.
     If the call of the method for an argument item returns a new item
@@ -640,8 +640,7 @@ void Item_func::print_op(String *str, enum_query_type query_type)
     str->append(func_name());
     str->append(' ');
   }
-  args[arg_count-1]->print_parenthesised(str, query_type,
-                                         (enum precedence)(precedence() + 1));
+  args[arg_count-1]->print_parenthesised(str, query_type, higher_precedence());
 }
 
 
@@ -1564,7 +1563,7 @@ bool Item_func_div::fix_length_and_dec()
   DBUG_ENTER("Item_func_div::fix_length_and_dec");
   DBUG_PRINT("info", ("name %s", func_name()));
   prec_increment= current_thd->variables.div_precincrement;
-  maybe_null= 1; // devision by zero
+  maybe_null= 1; // division by zero
 
   const Type_aggregator *aggregator= &type_handler_data->m_type_aggregator_for_div;
   DBUG_EXECUTE_IF("num_op", aggregator= &type_handler_data->m_type_aggregator_non_commutative_test;);
@@ -2243,35 +2242,54 @@ bool Item_func_bit_neg::fix_length_and_dec()
 
 void Item_func_int_val::fix_length_and_dec_int_or_decimal()
 {
+  DBUG_ASSERT(args[0]->cmp_type() == DECIMAL_RESULT);
+  DBUG_ASSERT(args[0]->max_length <= DECIMAL_MAX_STR_LENGTH);
   /*
-    The INT branch of this code should be revised.
-    It creates too large data types, e.g.
-      CREATE OR REPLACE TABLE t2 AS SELECT FLOOR(9999999.999) AS fa;
-    results in a BININT(10) column, while INT(7) should probably be enough.
+    FLOOR() for negative numbers can increase length:   floor(-9.9) -> -10
+    CEILING() for positive numbers can increase length:  ceil(9.9)  -> 10
   */
-  ulonglong tmp_max_length= (ulonglong ) args[0]->max_length - 
-    (args[0]->decimals ? args[0]->decimals + 1 : 0) + 2;
-  max_length= tmp_max_length > (ulonglong) UINT_MAX32 ?
-    (uint32) UINT_MAX32 : (uint32) tmp_max_length;
-  uint tmp= float_length(decimals);
-  set_if_smaller(max_length,tmp);
-  decimals= 0;
+  decimal_round_mode mode= round_mode();
+  uint length_increase= args[0]->decimals > 0 &&
+                        (mode == CEILING ||
+                         (mode == FLOOR && !args[0]->unsigned_flag)) ? 1 : 0;
+  uint precision= args[0]->decimal_int_part() + length_increase;
+  set_if_bigger(precision, 1);
 
   /*
-    -2 because in most high position can't be used any digit for longlong
-    and one position for increasing value during operation
+    The BIGINT data type can store:
+    UNSIGNED BIGINT: 0..18446744073709551615                     - up to 19 digits
+      SIGNED BIGINT:   -9223372036854775808..9223372036854775807 - up to 18 digits
+
+    The INT data type can store:
+        UNSIGNED INT:  0..4294967295          - up to 9 digits
+          SIGNED INT: -2147483648..2147483647 - up to 9 digits
   */
-  if (args[0]->max_length - args[0]->decimals >= DECIMAL_LONGLONG_DIGITS - 2)
+  if (precision > 18)
   {
+    unsigned_flag= args[0]->unsigned_flag;
     fix_char_length(
-      my_decimal_precision_to_length_no_truncation(
-        args[0]->decimal_int_part(), 0, false));
+      my_decimal_precision_to_length_no_truncation(precision, 0,
+                                                   unsigned_flag));
     set_handler(&type_handler_newdecimal);
   }
   else
   {
-    unsigned_flag= args[0]->unsigned_flag;
-    set_handler(type_handler_long_or_longlong());
+    uint sign_length= (unsigned_flag= args[0]->unsigned_flag) ? 0 : 1;
+    fix_char_length(precision + sign_length);
+    if (precision > 9)
+    {
+      if (unsigned_flag)
+        set_handler(&type_handler_ulonglong);
+      else
+        set_handler(&type_handler_slonglong);
+    }
+    else
+    {
+      if (unsigned_flag)
+        set_handler(&type_handler_ulong);
+      else
+        set_handler(&type_handler_slong);
+    }
   }
 }
 
@@ -2288,10 +2306,13 @@ bool Item_func_int_val::fix_length_and_dec()
 {
   DBUG_ENTER("Item_func_int_val::fix_length_and_dec");
   DBUG_PRINT("info", ("name %s", func_name()));
-  if (args[0]->cast_to_int_type_handler()->
-      Item_func_int_val_fix_length_and_dec(this))
+  /*
+    We don't want to translate ENUM/SET to CHAR here.
+    So let's call real_type_handler(), not type_handler().
+  */
+  if (args[0]->real_type_handler()->Item_func_int_val_fix_length_and_dec(this))
     DBUG_RETURN(TRUE);
-  DBUG_PRINT("info", ("Type: %s", type_handler()->name().ptr()));
+  DBUG_PRINT("info", ("Type: %s", real_type_handler()->name().ptr()));
   DBUG_RETURN(FALSE);
 }
 
@@ -2299,6 +2320,7 @@ bool Item_func_int_val::fix_length_and_dec()
 longlong Item_func_ceiling::int_op()
 {
   switch (args[0]->result_type()) {
+  case STRING_RESULT: // hex hybrid
   case INT_RESULT:
     return val_int_from_item(args[0]);
   case DECIMAL_RESULT:
@@ -2332,9 +2354,32 @@ my_decimal *Item_func_ceiling::decimal_op(my_decimal *decimal_value)
 }
 
 
+bool Item_func_ceiling::date_op(THD *thd, MYSQL_TIME *to, date_mode_t fuzzydate)
+{
+  Datetime::Options opt(thd, TIME_FRAC_TRUNCATE);
+  Datetime *tm= new (to) Datetime(thd, args[0], opt);
+  tm->ceiling(thd);
+  null_value= !tm->is_valid_datetime();
+  DBUG_ASSERT(maybe_null || !null_value);
+  return null_value;
+}
+
+
+bool Item_func_ceiling::time_op(THD *thd, MYSQL_TIME *to)
+{
+  static const Time::Options_for_round opt;
+  Time *tm= new (to) Time(thd, args[0], opt);
+  tm->ceiling();
+  null_value= !tm->is_valid_time();
+  DBUG_ASSERT(maybe_null || !null_value);
+  return null_value;
+}
+
+
 longlong Item_func_floor::int_op()
 {
   switch (args[0]->result_type()) {
+  case STRING_RESULT: // hex hybrid
   case INT_RESULT:
     return val_int_from_item(args[0]);
   case DECIMAL_RESULT:
@@ -2369,6 +2414,28 @@ my_decimal *Item_func_floor::decimal_op(my_decimal *decimal_value)
                      value.round_to(decimal_value, 0, FLOOR) > 1)))
     return decimal_value;
   return 0;
+}
+
+
+bool Item_func_floor::date_op(THD *thd, MYSQL_TIME *to, date_mode_t fuzzydate)
+{
+  // DATETIME is not negative, so FLOOR means just truncation
+  Datetime::Options opt(thd, TIME_FRAC_TRUNCATE);
+  Datetime *tm= new (to) Datetime(thd, args[0], opt, 0);
+  null_value= !tm->is_valid_datetime();
+  DBUG_ASSERT(maybe_null || !null_value);
+  return null_value;
+}
+
+
+bool Item_func_floor::time_op(THD *thd, MYSQL_TIME *to)
+{
+  static const Time::Options_for_round opt;
+  Time *tm= new (to) Time(thd, args[0], opt);
+  tm->floor();
+  null_value= !tm->is_valid_time();
+  DBUG_ASSERT(maybe_null || !null_value);
+  return null_value;
 }
 
 
@@ -2467,29 +2534,73 @@ void Item_func_round::fix_arg_datetime()
 }
 
 
-void Item_func_round::fix_arg_int()
+bool Item_func_round::test_if_length_can_increase()
 {
-  if (args[1]->const_item())
+  if (truncate)
+    return false;
+  if (args[1]->const_item() && !args[1]->is_expensive())
   {
+    // Length can increase in some cases: e.g. ROUND(9,-1) -> 10.
     Longlong_hybrid val1= args[1]->to_longlong_hybrid();
-    if (args[1]->null_value)
-      fix_length_and_dec_double(NOT_FIXED_DEC);
-    else if ((!val1.to_uint(DECIMAL_MAX_SCALE) && truncate) ||
-             args[0]->decimal_precision() < DECIMAL_LONGLONG_DIGITS)
-    {
-      // Length can increase in some cases: ROUND(9,-1) -> 10
-      int length_can_increase= MY_TEST(!truncate && val1.neg());
-      max_length= args[0]->max_length + length_can_increase;
-      // Here we can keep INT_RESULT
-      unsigned_flag= args[0]->unsigned_flag;
-      decimals= 0;
-      set_handler(type_handler_long_or_longlong());
-    }
-    else
-      fix_length_and_dec_decimal(val1.to_uint(DECIMAL_MAX_SCALE));
+    return !args[1]->null_value && val1.neg();
+  }
+  return true; // ROUND(x,n), where n is not a constant.
+}
+
+
+/**
+  Calculate data type and attributes for INT-alike input.
+
+  @param [IN] preferred - The preferred data type handler for simple cases
+                          such as ROUND(x) and TRUNCATE(x,0), when the input
+                          is short enough to fit into an integer type
+                          (without extending to DECIMAL).
+                          - If `preferred` is not NULL, then the code tries
+                            to preserve the given data type handler and
+                            the data type attributes `preferred_attrs`.
+                          - If `preferred` is NULL, then the code fully
+                            calculates attributes using
+                            args[0]->decimal_precision() and chooses between
+                            INT and BIGINT, depending on attributes.
+  @param [IN] preferred_attrs - The preferred data type attributes for
+                                simple cases.
+*/
+void Item_func_round::fix_arg_int(const Type_handler *preferred,
+                                  const Type_std_attributes *preferred_attrs,
+                                  bool use_decimal_on_length_increase)
+{
+  DBUG_ASSERT(args[0]->decimals == 0);
+
+  Type_std_attributes::set(preferred_attrs);
+  if (!test_if_length_can_increase())
+  {
+    // Preserve the exact data type and attributes
+    set_handler(preferred);
   }
   else
-    fix_length_and_dec_double(args[0]->decimals);
+  {
+    max_length++;
+    if (use_decimal_on_length_increase)
+      set_handler(&type_handler_newdecimal);
+    else
+      set_handler(type_handler_long_or_longlong());
+  }
+}
+
+
+void Item_func_round::fix_arg_hex_hybrid()
+{
+  DBUG_ASSERT(args[0]->decimals == 0);
+  DBUG_ASSERT(args[0]->decimal_precision() < DECIMAL_LONGLONG_DIGITS);
+  DBUG_ASSERT(args[0]->unsigned_flag); // no needs to add sign length
+  bool length_can_increase= test_if_length_can_increase();
+  max_length= args[0]->decimal_precision() + MY_TEST(length_can_increase);
+  unsigned_flag= true;
+  decimals= 0;
+  if (length_can_increase && args[0]->max_length >= 8)
+    set_handler(&type_handler_newdecimal);
+  else
+    set_handler(type_handler_long_or_longlong());
 }
 
 
@@ -2610,9 +2721,7 @@ bool Item_func_round::time_op(THD *thd, MYSQL_TIME *to)
 {
   DBUG_ASSERT(args[0]->type_handler()->mysql_timestamp_type() ==
               MYSQL_TIMESTAMP_TIME);
-  Time::Options opt(Time::default_flags_for_get_date(),
-                    truncate ? TIME_FRAC_TRUNCATE : TIME_FRAC_ROUND,
-                    Time::DATETIME_TO_TIME_DISALLOW);
+  Time::Options_for_round opt(truncate ? TIME_FRAC_TRUNCATE : TIME_FRAC_ROUND);
   Longlong_hybrid_null dec= args[1]->to_longlong_hybrid_null();
   Time *tm= new (to) Time(thd, args[0], opt,
                           dec.to_uint(TIME_SECOND_PART_DIGITS));
@@ -3905,6 +4014,8 @@ int Interruptible_wait::wait(mysql_cond_t *cond, mysql_mutex_t *mutex)
       timeout= m_abs_timeout;
 
     error= mysql_cond_timedwait(cond, mutex, &timeout);
+    if (m_thd->check_killed())
+      break;
     if (error == ETIMEDOUT || error == ETIME)
     {
       /* Return error if timed out or connection is broken. */
@@ -4724,7 +4835,7 @@ bool Item_func_set_user_var::register_field_in_bitmap(void *arg)
   @param type           type of new value
   @param cs             charset info for new value
   @param dv             derivation for new value
-  @param unsigned_arg   indiates if a value of type INT_RESULT is unsigned
+  @param unsigned_arg   indicates if a value of type INT_RESULT is unsigned
 
   @note Sets error and fatal error if allocation fails.
 
@@ -4783,7 +4894,8 @@ update_hash(user_var_entry *entry, bool set_null, void *ptr, size_t length,
       length--;					// Fix length change above
       entry->value[length]= 0;			// Store end \0
     }
-    memmove(entry->value, ptr, length);
+    if (length)
+      memmove(entry->value, ptr, length);
     if (type == DECIMAL_RESULT)
       ((my_decimal*)entry->value)->fix_buffer_pointer();
     entry->length= length;
@@ -6662,7 +6774,7 @@ Item_func_sp::fix_fields(THD *thd, Item **ref)
     /*
       Here we check privileges of the stored routine only during view
       creation, in order to validate the view.  A runtime check is
-      perfomed in Item_func_sp::execute(), and this method is not
+      performed in Item_func_sp::execute(), and this method is not
       called during context analysis.  Notice, that during view
       creation we do not infer into stored routine bodies and do not
       check privileges of its statements, which would probably be a

@@ -65,12 +65,15 @@ savepoint. */
 /** Push an object to an mtr memo stack. */
 #define mtr_memo_push(m, o, t)	(m)->memo_push(o, t)
 
-#define mtr_s_lock_space(s, m)	(m)->s_lock_space((s), __FILE__, __LINE__)
-#define mtr_x_lock_space(s, m)	(m)->x_lock_space((s), __FILE__, __LINE__)
-
-#define mtr_s_lock_index(i, m)	(m)->s_lock(&(i)->lock, __FILE__, __LINE__)
-#define mtr_x_lock_index(i, m)	(m)->x_lock(&(i)->lock, __FILE__, __LINE__)
-#define mtr_sx_lock_index(i, m)	(m)->sx_lock(&(i)->lock, __FILE__, __LINE__)
+#ifdef UNIV_PFS_RWLOCK
+# define mtr_s_lock_index(i,m)	(m)->s_lock(__FILE__, __LINE__, &(i)->lock)
+# define mtr_x_lock_index(i,m)	(m)->x_lock(__FILE__, __LINE__, &(i)->lock)
+# define mtr_sx_lock_index(i,m)	(m)->u_lock(__FILE__, __LINE__, &(i)->lock)
+#else
+# define mtr_s_lock_index(i,m)	(m)->s_lock(&(i)->lock)
+# define mtr_x_lock_index(i,m)	(m)->x_lock(&(i)->lock)
+# define mtr_sx_lock_index(i,m)	(m)->u_lock(&(i)->lock)
+#endif
 
 #define mtr_release_block_at_savepoint(m, s, b)				\
 				(m)->release_block_at_savepoint((s), (b))
@@ -106,7 +109,7 @@ struct mtr_t {
   /** Commit a mini-transaction that did not modify any pages,
   but generated some redo log on a higher level, such as
   FILE_MODIFY records and an optional FILE_CHECKPOINT marker.
-  The caller must invoke log_mutex_enter() and log_mutex_exit().
+  The caller must hold log_sys.mutex.
   This is to be used at log_checkpoint().
   @param checkpoint_lsn   the log sequence number of a checkpoint, or 0 */
   void commit_files(lsn_t checkpoint_lsn= 0);
@@ -120,7 +123,7 @@ struct mtr_t {
 	@param lock		latch to release */
 	inline void release_s_latch_at_savepoint(
 		ulint		savepoint,
-		rw_lock_t*	lock);
+		index_lock*	lock);
 
 	/** Release the block in an mtr memo after a savepoint. */
 	inline void release_block_at_savepoint(
@@ -141,10 +144,19 @@ struct mtr_t {
     return static_cast<mtr_log_t>(m_log_mode);
   }
 
-	/** Change the logging mode.
-	@param mode	 logging mode
-	@return	old mode */
-	inline mtr_log_t set_log_mode(mtr_log_t mode);
+  /** Change the logging mode.
+  @param mode	 logging mode
+  @return	old mode */
+  mtr_log_t set_log_mode(mtr_log_t mode)
+  {
+    const mtr_log_t old_mode= get_log_mode();
+    m_log_mode= mode & 3;
+    return old_mode;
+  }
+
+  /** Check if we are holding a block latch in exclusive mode
+  @param block  buffer pool block to search for */
+  bool have_x_latch(const buf_block_t &block) const;
 
 	/** Copy the tablespaces associated with the mini-transaction
 	(needed for generating FILE_MODIFY records)
@@ -205,68 +217,56 @@ struct mtr_t {
 
 	/** Acquire a tablespace X-latch.
 	@param[in]	space_id	tablespace ID
-	@param[in]	file		file name from where called
-	@param[in]	line		line number in file
 	@return the tablespace object (never NULL) */
-	fil_space_t* x_lock_space(
-		ulint		space_id,
-		const char*	file,
-		unsigned	line);
+	fil_space_t* x_lock_space(ulint space_id);
 
-	/** Acquire a shared rw-latch.
-	@param[in]	lock	rw-latch
-	@param[in]	file	file name from where called
-	@param[in]	line	line number in file */
-	void s_lock(rw_lock_t* lock, const char* file, unsigned line)
-	{
-		rw_lock_s_lock_inline(lock, 0, file, line);
-		memo_push(lock, MTR_MEMO_S_LOCK);
-	}
+  /** Acquire a shared rw-latch. */
+  void s_lock(
+#ifdef UNIV_PFS_RWLOCK
+    const char *file, unsigned line,
+#endif
+    index_lock *lock)
+  {
+    lock->s_lock(SRW_LOCK_ARGS(file, line));
+    memo_push(lock, MTR_MEMO_S_LOCK);
+  }
 
-	/** Acquire an exclusive rw-latch.
-	@param[in]	lock	rw-latch
-	@param[in]	file	file name from where called
-	@param[in]	line	line number in file */
-	void x_lock(rw_lock_t* lock, const char* file, unsigned line)
-	{
-		rw_lock_x_lock_inline(lock, 0, file, line);
-		memo_push(lock, MTR_MEMO_X_LOCK);
-	}
+  /** Acquire an exclusive rw-latch. */
+  void x_lock(
+#ifdef UNIV_PFS_RWLOCK
+    const char *file, unsigned line,
+#endif
+    index_lock *lock)
+  {
+    lock->x_lock(SRW_LOCK_ARGS(file, line));
+    memo_push(lock, MTR_MEMO_X_LOCK);
+  }
 
-	/** Acquire an shared/exclusive rw-latch.
-	@param[in]	lock	rw-latch
-	@param[in]	file	file name from where called
-	@param[in]	line	line number in file */
-	void sx_lock(rw_lock_t* lock, const char* file, unsigned line)
-	{
-		rw_lock_sx_lock_inline(lock, 0, file, line);
-		memo_push(lock, MTR_MEMO_SX_LOCK);
-	}
+  /** Acquire an update latch. */
+  void u_lock(
+#ifdef UNIV_PFS_RWLOCK
+    const char *file, unsigned line,
+#endif
+    index_lock *lock)
+  {
+    lock->u_lock(SRW_LOCK_ARGS(file, line));
+    memo_push(lock, MTR_MEMO_SX_LOCK);
+  }
 
 	/** Acquire a tablespace S-latch.
-	@param[in]	space	tablespace
-	@param[in]	file	file name from where called
-	@param[in]	line	line number in file */
-	void s_lock_space(fil_space_t* space, const char* file, unsigned line)
+	@param[in]	space	tablespace */
+	void s_lock_space(fil_space_t* space)
 	{
 		ut_ad(space->purpose == FIL_TYPE_TEMPORARY
 		      || space->purpose == FIL_TYPE_IMPORT
 		      || space->purpose == FIL_TYPE_TABLESPACE);
-		s_lock(&space->latch, file, line);
+		memo_push(space, MTR_MEMO_SPACE_S_LOCK);
+		space->s_lock();
 	}
 
 	/** Acquire a tablespace X-latch.
-	@param[in]	space	tablespace
-	@param[in]	file	file name from where called
-	@param[in]	line	line number in file */
-	void x_lock_space(fil_space_t* space, const char* file, unsigned line)
-	{
-		ut_ad(space->purpose == FIL_TYPE_TEMPORARY
-		      || space->purpose == FIL_TYPE_IMPORT
-		      || space->purpose == FIL_TYPE_TABLESPACE);
-		x_lock(&space->latch, file, line);
-	}
-
+	@param[in]	space	tablespace */
+	void x_lock_space(fil_space_t* space);
 	/** Release an object in the memo stack.
 	@param object	object
 	@param type	object type
@@ -280,19 +280,13 @@ struct mtr_t {
 private:
   /** Note that the mini-transaction will modify data. */
   void flag_modified() { m_modifications = true; }
-#ifdef UNIV_DEBUG
   /** Mark the given latched page as modified.
   @param block   page that will be modified */
   void modify(const buf_block_t& block);
 public:
   /** Note that the mini-transaction will modify a block. */
   void set_modified(const buf_block_t &block)
-  { flag_modified(); if (m_log_mode == MTR_LOG_ALL) modify(block); }
-#else /* UNIV_DEBUG */
-public:
-  /** Note that the mini-transaction will modify a block. */
-  void set_modified(const buf_block_t &) { flag_modified(); }
-#endif /* UNIV_DEBUG */
+  { flag_modified(); if (m_log_mode != MTR_LOG_NONE) modify(block); }
 
   /** Set the state to not-modified. This will not log the changes.
   This is only used during redo log apply, to avoid logging the changes. */
@@ -330,12 +324,29 @@ public:
     return false;
 #endif
   }
+
+  /** Latch a buffer pool block.
+  @param block    block to be latched
+  @param rw_latch RW_S_LATCH, RW_SX_LATCH, RW_X_LATCH, RW_NO_LATCH */
+  void page_lock(buf_block_t *block, ulint rw_latch);
+
+  /** Upgrade U locks on a block to X */
+  void page_lock_upgrade(const buf_block_t &block);
+  /** Upgrade X lock to X */
+  void lock_upgrade(const index_lock &lock);
+
+  /** Check if we are holding tablespace latch
+  @param space  tablespace to search for
+  @param shared whether to look for shared latch, instead of exclusive
+  @return whether space.latch is being held */
+  bool memo_contains(const fil_space_t& space, bool shared= false)
+    MY_ATTRIBUTE((warn_unused_result));
 #ifdef UNIV_DEBUG
   /** Check if we are holding an rw-latch in this mini-transaction
   @param lock   latch to search for
   @param type   held latch type
   @return whether (lock,type) is contained */
-  bool memo_contains(const rw_lock_t &lock, mtr_memo_type_t type)
+  bool memo_contains(const index_lock &lock, mtr_memo_type_t type)
     MY_ATTRIBUTE((warn_unused_result));
 
 	/** Check if memo contains the given item.
@@ -585,6 +596,11 @@ public:
     m_freed_pages->add_value(id.page_no());
   }
 
+  /** Determine the added buffer fix count of a block.
+  @param block block to be checked
+  @return number of buffer count added by this mtr */
+  uint32_t get_fix_count(const buf_block_t *block) const;
+
 private:
   /** Log a write of a byte string to a page.
   @param block   buffer page
@@ -617,8 +633,8 @@ private:
 
   /** Append the redo log records to the redo log buffer.
   @param len   number of bytes to write
-  @return start_lsn */
-  inline lsn_t finish_write(ulint len);
+  @return {start_lsn,flush_ahead} */
+  inline std::pair<lsn_t,bool> finish_write(ulint len);
 
   /** Release the resources */
   inline void release_resources();

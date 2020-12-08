@@ -24,8 +24,7 @@ Starts the Innobase database server
 Created 10/10/1995 Heikki Tuuri
 *******************************************************/
 
-#ifndef srv0start_h
-#define srv0start_h
+#pragma once
 
 #include "log0log.h"
 #include "ut0byte.h"
@@ -97,8 +96,6 @@ extern	lsn_t	srv_shutdown_lsn;
 
 /** TRUE if the server is being started */
 extern	bool	srv_is_being_started;
-/** TRUE if SYS_TABLESPACES is available for lookups */
-extern	bool	srv_sys_tablespaces_open;
 /** TRUE if the server is being started, before rolling back any
 incomplete transactions */
 extern	bool	srv_startup_is_before_trx_rollback_phase;
@@ -113,11 +110,6 @@ enum srv_shutdown_t {
 	SRV_SHUTDOWN_INITIATED,
 	SRV_SHUTDOWN_CLEANUP,	/*!< Cleaning up in
 				logs_empty_and_mark_files_at_shutdown() */
-	SRV_SHUTDOWN_FLUSH_PHASE,/*!< At this phase the master and the
-				purge threads must have completed their
-				work. Once we enter this phase the
-				page_cleaner can clean up the buffer
-				pool and exit */
 	SRV_SHUTDOWN_LAST_PHASE,/*!< Last phase after ensuring that
 				the buffer pool can be freed: flush
 				all file spaces and close all files */
@@ -133,4 +125,3 @@ extern	enum srv_shutdown_t	srv_shutdown_state;
 
 /** Files comprising the system tablespace */
 extern pfs_os_file_t	files[1000];
-#endif

@@ -1316,7 +1316,12 @@ bool wait_while_table_is_used(THD *thd, TABLE *table,
   table->s->tdc->flush(thd, true);
   /* extra() call must come only after all instances above are closed */
   if (function != HA_EXTRA_NOT_USED)
-    (void) table->file->extra(function);
+  {
+    int error= table->file->extra(function);
+    if (error)
+      table->file->print_error(error, MYF(0));
+    DBUG_RETURN(error);
+  }
   DBUG_RETURN(FALSE);
 }
 
@@ -1777,7 +1782,14 @@ bool open_table(THD *thd, TABLE_LIST *table_list, Open_table_context *ot_ctx)
     }
 
     if (is_locked_view(thd, table_list))
+    {
+      if (table_list->sequence)
+      {
+        my_error(ER_NOT_SEQUENCE, MYF(0), table_list->db.str, table_list->alias.str);
+        DBUG_RETURN(true);
+      }
       DBUG_RETURN(FALSE); // VIEW
+    }
 
     /*
       No table in the locked tables list. In case of explicit LOCK TABLES
@@ -1906,7 +1918,12 @@ retry_share:
     DBUG_RETURN(FALSE);
   }
 
+#ifdef WITH_WSREP
+  if (!((flags & MYSQL_OPEN_IGNORE_FLUSH) ||
+        (thd->wsrep_applier)))
+#else
   if (!(flags & MYSQL_OPEN_IGNORE_FLUSH))
+#endif
   {
     if (share->tdc->flushed)
     {
@@ -3900,7 +3917,8 @@ static bool upgrade_lock_if_not_exists(THD *thd,
   {
     DEBUG_SYNC(thd,"create_table_before_check_if_exists");
     if (!create_info.or_replace() &&
-        ha_table_exists(thd, &create_table->db, &create_table->table_name))
+        ha_table_exists(thd, &create_table->db, &create_table->table_name,
+                        &create_table->db_type))
     {
       if (create_info.if_not_exists())
       {
@@ -3948,7 +3966,8 @@ static bool upgrade_lock_if_not_exists(THD *thd,
   Note that for CREATE TABLE IF EXISTS we only generate a warning
   but still return TRUE (to abort the calling open_table() function).
   On must check THD->is_error() if one wants to distinguish between warning
-  and error.
+  and error.  If table existed, tables_start->db_type is set to the handlerton
+  for the found table.
 */
 
 bool
@@ -5332,6 +5351,24 @@ static void mark_real_tables_as_free_for_reuse(TABLE_LIST *table_list)
   DBUG_VOID_RETURN;
 }
 
+int TABLE::fix_vcol_exprs(THD *thd)
+{
+  for (Field **vf= vfield; vf && *vf; vf++)
+    if (fix_session_vcol_expr(thd, (*vf)->vcol_info))
+      return 1;
+
+  for (Field **df= default_field; df && *df; df++)
+    if ((*df)->default_value &&
+        fix_session_vcol_expr(thd, (*df)->default_value))
+      return 1;
+
+  for (Virtual_column_info **cc= check_constraints; cc && *cc; cc++)
+    if (fix_session_vcol_expr(thd, (*cc)))
+      return 1;
+
+  return 0;
+}
+
 
 static bool fix_all_session_vcol_exprs(THD *thd, TABLE_LIST *tables)
 {
@@ -5339,36 +5376,27 @@ static bool fix_all_session_vcol_exprs(THD *thd, TABLE_LIST *tables)
   TABLE_LIST *first_not_own= thd->lex->first_not_own_table();
   DBUG_ENTER("fix_session_vcol_expr");
 
-  for (TABLE_LIST *table= tables; table && table != first_not_own;
+  int error= 0;
+  for (TABLE_LIST *table= tables; table && table != first_not_own && !error;
        table= table->next_global)
   {
     TABLE *t= table->table;
     if (!table->placeholder() && t->s->vcols_need_refixing &&
          table->lock_type >= TL_WRITE_ALLOW_WRITE)
     {
+      Query_arena *stmt_backup= thd->stmt_arena;
+      if (thd->stmt_arena->is_conventional())
+        thd->stmt_arena= t->expr_arena;
       if (table->security_ctx)
         thd->security_ctx= table->security_ctx;
 
-      for (Field **vf= t->vfield; vf && *vf; vf++)
-        if (fix_session_vcol_expr(thd, (*vf)->vcol_info))
-          goto err;
-
-      for (Field **df= t->default_field; df && *df; df++)
-        if ((*df)->default_value &&
-            fix_session_vcol_expr(thd, (*df)->default_value))
-          goto err;
-
-      for (Virtual_column_info **cc= t->check_constraints; cc && *cc; cc++)
-        if (fix_session_vcol_expr(thd, (*cc)))
-          goto err;
+      error= t->fix_vcol_exprs(thd);
 
       thd->security_ctx= save_security_ctx;
+      thd->stmt_arena= stmt_backup;
     }
   }
-  DBUG_RETURN(0);
-err:
-  thd->security_ctx= save_security_ctx;
-  DBUG_RETURN(1);
+  DBUG_RETURN(error);
 }
 
 
@@ -6328,10 +6356,11 @@ find_field_in_tables(THD *thd, Item_ident *item,
         for (SELECT_LEX *sl= current_sel; sl && sl!=last_select;
              sl=sl->outer_select())
         {
-          Item *subs= sl->master_unit()->item;
-          if (subs->type() == Item::SUBSELECT_ITEM && 
-              ((Item_subselect*)subs)->substype() == Item_subselect::IN_SUBS &&
-              ((Item_in_subselect*)subs)->test_strategy(SUBS_SEMI_JOIN))
+          Item_in_subselect *in_subs=
+            sl->master_unit()->item->get_IN_subquery();
+          if (in_subs &&
+              in_subs->substype() == Item_subselect::IN_SUBS &&
+              in_subs->test_strategy(SUBS_SEMI_JOIN))
           {
             continue;
           }
@@ -7852,8 +7881,7 @@ bool setup_tables(THD *thd, Name_resolution_context *context,
     FALSE ok;  In this case *map will include the chosen index
     TRUE  error
 */
-bool setup_tables_and_check_access(THD *thd, 
-                                   Name_resolution_context *context,
+bool setup_tables_and_check_access(THD *thd, Name_resolution_context *context,
                                    List<TABLE_LIST> *from_clause,
                                    TABLE_LIST *tables,
                                    List<TABLE_LIST> &leaves,
@@ -8230,7 +8258,7 @@ bool setup_on_expr(THD *thd, TABLE_LIST *table, bool is_update)
       */
       if (embedded->sj_subq_pred)
       {
-        Item **left_expr= &embedded->sj_subq_pred->left_expr;
+        Item **left_expr= embedded->sj_subq_pred->left_exp_ptr();
         if ((*left_expr)->fix_fields_if_needed(thd, left_expr))
           return TRUE;
       }
@@ -8725,14 +8753,17 @@ fill_record(THD *thd, TABLE *table, Field **ptr, List<Item> &values,
         goto err;
     field->set_has_explicit_value();
   }
-  /* Update virtual fields */
-  thd->abort_on_warning= FALSE;
-  if (table->versioned())
-    table->vers_update_fields();
-  if (table->vfield &&
-      table->update_virtual_fields(table->file, VCOL_UPDATE_FOR_WRITE))
-    goto err;
-  thd->abort_on_warning= abort_on_warning_saved;
+  /* Update virtual fields if there wasn't any errors */
+  if (!thd->is_error())
+  {
+    thd->abort_on_warning= FALSE;
+    if (table->versioned())
+      table->vers_update_fields();
+    if (table->vfield &&
+        table->update_virtual_fields(table->file, VCOL_UPDATE_FOR_WRITE))
+      goto err;
+    thd->abort_on_warning= abort_on_warning_saved;
+  }
   DBUG_RETURN(thd->is_error());
 
 err:
@@ -9009,9 +9040,12 @@ void
 close_mysql_tables(THD *thd)
 {
   if (! thd->in_sub_stmt)
+  {
     trans_commit_stmt(thd);
+    trans_commit(thd);
+  }
   close_thread_tables(thd);
-  thd->mdl_context.release_transactional_locks();
+  thd->release_transactional_locks();
 }
 
 /*

@@ -348,6 +348,12 @@ void thd_clear_errors(THD *thd)
 }
 
 
+extern "C" unsigned long long thd_query_id(const MYSQL_THD thd)
+{
+  return((unsigned long long)thd->query_id);
+}
+
+
 /**
   Get thread attributes for connection threads
 
@@ -707,6 +713,7 @@ THD::THD(my_thread_id id, bool is_wsrep_applier)
    wsrep_affected_rows(0),
    wsrep_has_ignored_error(false),
    wsrep_ignore_table(false),
+   wsrep_aborter(0),
 
 /* wsrep-lib */
    m_wsrep_next_trx_id(WSREP_UNDEFINED_TRX_ID),
@@ -1226,10 +1233,8 @@ extern "C" my_thread_id next_thread_id_noinline()
 #endif
 
 
-const Type_handler *THD::type_handler_for_date() const
+const Type_handler *THD::type_handler_for_datetime() const
 {
-  if (!(variables.sql_mode & MODE_ORACLE))
-    return &type_handler_newdate;
   if (opt_mysql56_temporal_format)
     return &type_handler_datetime2;
   return &type_handler_datetime;
@@ -1294,6 +1299,7 @@ void THD::init()
   first_successful_insert_id_in_prev_stmt_for_binlog= 0;
   first_successful_insert_id_in_cur_stmt= 0;
   current_backup_stage= BACKUP_FINISHED;
+  backup_commit_lock= 0;
 #ifdef WITH_WSREP
   wsrep_last_query_id= 0;
   wsrep_xid.null();
@@ -1309,6 +1315,7 @@ void THD::init()
   wsrep_rbr_buf           = NULL;
   wsrep_affected_rows     = 0;
   m_wsrep_next_trx_id     = WSREP_UNDEFINED_TRX_ID;
+  wsrep_aborter           = 0;
 #endif /* WITH_WSREP */
 
   if (variables.sql_log_bin)
@@ -1395,9 +1402,11 @@ void THD::update_all_stats()
 
 void THD::init_for_queries()
 {
-  set_time(); 
-  ha_enable_transaction(this,TRUE);
+  DBUG_ASSERT(transaction->on);
+  DBUG_ASSERT(m_transaction_psi == NULL);
 
+  /* Set time for --init-file queries */
+  set_time();
   reset_root_defaults(mem_root, variables.query_alloc_block_size,
                       variables.query_prealloc_size);
   reset_root_defaults(&transaction->mem_root,
@@ -1549,13 +1558,15 @@ void THD::cleanup(void)
     trans_rollback(this);
 
   DBUG_ASSERT(open_tables == NULL);
+  DBUG_ASSERT(m_transaction_psi == NULL);
+
   /*
     If the thread was in the middle of an ongoing transaction (rolled
     back a few lines above) or under LOCK TABLES (unlocked the tables
     and left the mode a few lines above), there will be outstanding
     metadata locks. Release them.
   */
-  mdl_context.release_transactional_locks();
+  mdl_context.release_transactional_locks(this);
 
   backup_end(this);
   backup_unlock(this);
@@ -1649,6 +1660,7 @@ void THD::reset_for_reuse()
   abort_on_warning= 0;
   free_connection_done= 0;
   m_command= COM_CONNECT;
+  transaction->on= 1;
 #if defined(ENABLED_PROFILING)
   profiling.reset();
 #endif
@@ -2140,11 +2152,19 @@ void THD::reset_killed()
   DBUG_ENTER("reset_killed");
   if (killed != NOT_KILLED)
   {
+    mysql_mutex_assert_not_owner(&LOCK_thd_kill);
     mysql_mutex_lock(&LOCK_thd_kill);
     killed= NOT_KILLED;
     killed_err= 0;
     mysql_mutex_unlock(&LOCK_thd_kill);
   }
+#ifdef WITH_WSREP
+  mysql_mutex_assert_not_owner(&LOCK_thd_data);
+  mysql_mutex_lock(&LOCK_thd_data);
+  wsrep_aborter= 0;
+  mysql_mutex_unlock(&LOCK_thd_data);
+#endif /* WITH_WSREP */
+
   DBUG_VOID_RETURN;
 }
 
@@ -2494,7 +2514,8 @@ bool THD::to_ident_sys_alloc(Lex_ident_sys_st *to, const Lex_ident_cli_st *ident
 
 
 Item_basic_constant *
-THD::make_string_literal(const char *str, size_t length, uint repertoire)
+THD::make_string_literal(const char *str, size_t length,
+                         my_repertoire_t repertoire)
 {
   if (!length && (variables.sql_mode & MODE_EMPTY_STRING_IS_NULL))
     return new (mem_root) Item_null(this, 0, variables.collation_connection);
@@ -2569,7 +2590,7 @@ void THD::give_protection_error()
     my_error(ER_BACKUP_LOCK_IS_ACTIVE, MYF(0));
   else
   {
-    DBUG_ASSERT(global_read_lock.is_acquired());
+    DBUG_ASSERT(global_read_lock.is_acquired() || mdl_backup_lock);
     my_error(ER_CANT_UPDATE_WITH_READLOCK, MYF(0));
   }
 }
@@ -3739,7 +3760,6 @@ void select_dumpvar::cleanup()
 
 Query_arena::Type Query_arena::type() const
 {
-  DBUG_ASSERT(0); /* Should never be called */
   return STATEMENT;
 }
 
@@ -4900,7 +4920,7 @@ void destroy_background_thd(MYSQL_THD thd)
 void reset_thd(MYSQL_THD thd)
 {
   close_thread_tables(thd);
-  thd->mdl_context.release_transactional_locks();
+  thd->release_transactional_locks();
   thd->free_items();
   free_root(thd->mem_root, MYF(MY_KEEP_PREALLOC));
 }
@@ -4998,7 +5018,8 @@ extern "C" size_t thd_query_safe(MYSQL_THD thd, char *buf, size_t buflen)
   if (!mysql_mutex_trylock(&thd->LOCK_thd_data))
   {
     len= MY_MIN(buflen - 1, thd->query_length());
-    memcpy(buf, thd->query(), len);
+    if (len)
+      memcpy(buf, thd->query(), len);
     mysql_mutex_unlock(&thd->LOCK_thd_data);
   }
   buf[len]= '\0';
@@ -5006,13 +5027,53 @@ extern "C" size_t thd_query_safe(MYSQL_THD thd, char *buf, size_t buflen)
 }
 
 
-extern "C" int thd_slave_thread(const MYSQL_THD thd)
+extern "C" const char *thd_user_name(MYSQL_THD thd)
 {
-  return(thd->slave_thread);
+  if (!thd->security_ctx)
+    return 0;
+
+  return thd->security_ctx->user;
 }
 
 
+extern "C" const char *thd_client_host(MYSQL_THD thd)
+{
+  if (!thd->security_ctx)
+    return 0;
 
+  return thd->security_ctx->host;
+}
+
+
+extern "C" const char *thd_client_ip(MYSQL_THD thd)
+{
+  if (!thd->security_ctx)
+    return 0;
+
+  return thd->security_ctx->ip;
+}
+
+
+extern "C" LEX_CSTRING *thd_current_db(MYSQL_THD thd)
+{
+  return &thd->db;
+}
+
+
+extern "C" int thd_current_status(MYSQL_THD thd)
+{
+  Diagnostics_area *da= thd->get_stmt_da();
+  if (!da)
+    return 0;
+
+  return da->is_error() ? da->sql_errno() : 0;
+}
+
+
+extern "C" enum enum_server_command thd_current_command(MYSQL_THD thd)
+{
+  return thd->get_command();
+}
 
 /* Returns high resolution timestamp for the start
   of the current query. */
@@ -5838,7 +5899,8 @@ start_new_trans::start_new_trans(THD *thd)
   mdl_savepoint= thd->mdl_context.mdl_savepoint();
   memcpy(old_ha_data, thd->ha_data, sizeof(old_ha_data));
   thd->reset_n_backup_open_tables_state(&open_tables_state_backup);
-  bzero(thd->ha_data, sizeof(thd->ha_data));
+  for (auto &data : thd->ha_data)
+    data.reset();
   old_transaction= thd->transaction;
   thd->transaction= &new_transaction;
   new_transaction.on= 1;
@@ -6528,8 +6590,8 @@ exit:;
 /**
   Check if we should log a table DDL to the binlog
 
-  @@return true  yes
-  @@return false no
+  @retval true  yes
+  @retval false no
 */
 
 bool THD::binlog_table_should_be_logged(const LEX_CSTRING *db)
@@ -7418,14 +7480,14 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, char const *query_arg,
       */
       if (binlog_should_compress(query_len))
       {
-        Query_compressed_log_event qinfo(this, query_arg, query_len, is_trans, direct,
-                            suppress_use, errcode);
+        Query_compressed_log_event qinfo(this, query_arg, query_len, is_trans,
+                                         direct, suppress_use, errcode);
         error= mysql_bin_log.write(&qinfo);
       }
       else
       {
         Query_log_event qinfo(this, query_arg, query_len, is_trans, direct,
-          suppress_use, errcode);
+                              suppress_use, errcode);
         error= mysql_bin_log.write(&qinfo);
       }
       /*
@@ -7442,6 +7504,38 @@ int THD::binlog_query(THD::enum_binlog_query_type qtype, char const *query_arg,
   }
   DBUG_RETURN(0);
 }
+
+
+/**
+  Binlog current query as a statement, ignoring the binlog filter setting.
+
+  The filter is in decide_logging_format() to mark queries to not be stored
+  in the binary log, for example by a shared distributed engine like S3.
+  This function resets the filter to ensure the the query is logged if
+  the binlog is active.
+
+  Note that 'direct' is set to false, which means that the query will
+  not be directly written to the binary log but instead to the cache.
+
+  @retval false   ok
+  @retval true    error
+*/
+
+
+bool THD::binlog_current_query_unfiltered()
+{
+  if (!mysql_bin_log.is_open())
+    return 0;
+
+  reset_binlog_local_stmt_filter();
+  clear_binlog_local_stmt_filter();
+  return binlog_query(THD::STMT_QUERY_TYPE, query(), query_length(),
+                      /* is_trans */     FALSE,
+                      /* direct */       FALSE,
+                      /* suppress_use */ FALSE,
+                      /* Error */        0) > 0;
+}
+
 
 void
 THD::wait_for_wakeup_ready()
@@ -7618,16 +7712,33 @@ wait_for_commit::register_wait_for_prior_commit(wait_for_commit *waitee)
 }
 
 
-/*
-  Wait for commit of another transaction to complete, as already registered
+/**
+  Waits for commit of another transaction to complete, as already registered
   with register_wait_for_prior_commit(). If the commit already completed,
   returns immediately.
+
+  If thd->backup_commit_lock is set, release it while waiting for other threads
 */
+
 int
 wait_for_commit::wait_for_prior_commit2(THD *thd)
 {
   PSI_stage_info old_stage;
   wait_for_commit *loc_waitee;
+  bool backup_lock_released= 0;
+
+  /*
+    Release MDL_BACKUP_COMMIT LOCK while waiting for other threads to commit
+    This is needed to avoid deadlock between the other threads (which not
+    yet have the MDL_BACKUP_COMMIT_LOCK) and any threads using
+    BACKUP LOCK BLOCK_COMMIT.
+  */
+  if (thd->backup_commit_lock && thd->backup_commit_lock->ticket)
+  {
+    backup_lock_released= 1;
+    thd->mdl_context.release_lock(thd->backup_commit_lock->ticket);
+    thd->backup_commit_lock->ticket= 0;
+  }
 
   mysql_mutex_lock(&LOCK_wait_commit);
   DEBUG_SYNC(thd, "wait_for_prior_commit_waiting");
@@ -7677,10 +7788,16 @@ wait_for_commit::wait_for_prior_commit2(THD *thd)
     use within enter_cond/exit_cond.
   */
   DEBUG_SYNC(thd, "wait_for_prior_commit_killed");
+  if (backup_lock_released)
+    thd->mdl_context.acquire_lock(thd->backup_commit_lock,
+                                  thd->variables.lock_wait_timeout);
   return wakeup_error;
 
 end:
   thd->EXIT_COND(&old_stage);
+  if (backup_lock_released)
+    thd->mdl_context.acquire_lock(thd->backup_commit_lock,
+                                  thd->variables.lock_wait_timeout);
   return wakeup_error;
 }
 

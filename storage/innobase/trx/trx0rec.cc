@@ -53,15 +53,18 @@ const dtuple_t trx_undo_metadata = {
 /*=========== UNDO LOG RECORD CREATION AND DECODING ====================*/
 
 /** Calculate the free space left for extending an undo log record.
-@param[in]	undo_block	undo log page
-@param[in]	ptr		current end of the undo page
+@param undo_block    undo log page
+@param ptr           current end of the undo page
 @return bytes left */
-static ulint trx_undo_left(const buf_block_t* undo_block, const byte* ptr)
+static ulint trx_undo_left(const buf_block_t *undo_block, const byte *ptr)
 {
-	/* The 10 is a safety margin, in case we have some small
-	calculation error below */
-	return srv_page_size - ulint(ptr - undo_block->frame)
-		- (10 + FIL_PAGE_DATA_END);
+  ut_ad(ptr >= &undo_block->frame[TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE]);
+  /* The 10 is supposed to be an extra safety margin (and needed for
+  compatibility with older versions) */
+  lint left= srv_page_size - (ptr - undo_block->frame) -
+    (10 + FIL_PAGE_DATA_END);
+  ut_ad(left >= 0);
+  return left < 0 ? 0 : static_cast<ulint>(left);
 }
 
 /**********************************************************************//**
@@ -129,19 +132,34 @@ trx_undo_log_v_idx(
 {
 	ut_ad(pos < table->n_v_def);
 	dict_v_col_t*	vcol = dict_table_get_nth_v_col(table, pos);
-	ulint		n_idx = vcol->n_v_indexes;
 	byte*		old_ptr;
 
-	ut_ad(n_idx > 0);
+	ut_ad(!vcol->v_indexes.empty());
 
-	/* Size to reserve, max 5 bytes for each index id and position, plus
-	5 bytes for num of indexes, 2 bytes for write total length.
-	1 byte for undo log record format version marker */
-	ulint		size = n_idx * (5 + 5) + 5 + 2 + (first_v_col ? 1 : 0);
+	ulint		size = first_v_col ? 1 + 2 : 2;
+	const ulint	avail = trx_undo_left(undo_block, ptr);
 
-	if (trx_undo_left(undo_block, ptr) < size) {
+	/* The mach_write_compressed(ptr, flen) in
+	trx_undo_page_report_modify() will consume additional 1 to 5 bytes. */
+	if (avail < size + 5) {
 		return(NULL);
 	}
+
+	ulint n_idx = 0;
+	for (const auto& v_index : vcol->v_indexes) {
+		n_idx++;
+		/* FIXME: index->id is 64 bits! */
+		size += mach_get_compressed_size(uint32_t(v_index.index->id));
+		size += mach_get_compressed_size(v_index.nth_field);
+	}
+
+	size += mach_get_compressed_size(n_idx);
+
+	if (avail < size + 5) {
+		return(NULL);
+	}
+
+	ut_d(const byte* orig_ptr = ptr);
 
 	if (first_v_col) {
 		/* write the version marker */
@@ -158,10 +176,13 @@ trx_undo_log_v_idx(
 
 	for (const auto& v_index : vcol->v_indexes) {
 		ptr += mach_write_compressed(
-			ptr, static_cast<ulint>(v_index.index->id));
+			/* FIXME: index->id is 64 bits! */
+			ptr, uint32_t(v_index.index->id));
 
 		ptr += mach_write_compressed(ptr, v_index.nth_field);
 	}
+
+	ut_ad(orig_ptr + size == ptr);
 
 	mach_write_to_2(old_ptr, ulint(ptr - old_ptr));
 
@@ -377,9 +398,6 @@ trx_undo_page_report_insert(
 						+ TRX_UNDO_PAGE_FREE
 						+ undo_block->frame));
 	byte* ptr = undo_block->frame + first_free;
-
-	ut_ad(first_free >= TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE);
-	ut_ad(first_free <= srv_page_size - FIL_PAGE_DATA_END);
 
 	if (trx_undo_left(undo_block, ptr) < 2 + 1 + 11 + 11) {
 		/* Not enough space for writing the general parameters */
@@ -786,9 +804,6 @@ trx_undo_page_report_modify(
 
 	const uint16_t first_free = mach_read_from_2(ptr_to_first_free);
 	byte *ptr = undo_block->frame + first_free;
-
-	ut_ad(first_free >= TRX_UNDO_PAGE_HDR + TRX_UNDO_PAGE_HDR_SIZE);
-	ut_ad(first_free <= srv_page_size - FIL_PAGE_DATA_END);
 
 	if (trx_undo_left(undo_block, ptr) < 50) {
 		/* NOTE: the value 50 must be big enough so that the general
@@ -1896,8 +1911,6 @@ dberr_t trx_undo_report_rename(trx_t* trx, const dict_table_t* table)
 
 			if (uint16_t offset = trx_undo_page_report_rename(
 				    trx, table, block, &mtr)) {
-				undo->withdraw_clock
-					= buf_pool.withdraw_clock();
 				undo->top_page_no = undo->last_page_no;
 				undo->top_offset  = offset;
 				undo->top_undo_no = trx->undo_no++;
@@ -2026,7 +2039,7 @@ trx_undo_report_row_operation(
 				tree latch, which is the rseg
 				mutex. We must commit the mini-transaction
 				first, because it may be holding lower-level
-				latches, such as SYNC_FSP and SYNC_FSP_PAGE. */
+				latches, such as SYNC_FSP_PAGE. */
 
 				mtr.commit();
 				mtr.start();
@@ -2040,12 +2053,26 @@ trx_undo_report_row_operation(
 
 				err = DB_UNDO_RECORD_TOO_BIG;
 				goto err_exit;
+			} else {
+				/* Write log for clearing the unused
+				tail of the undo page. It might
+				contain some garbage from a previously
+				written record, and mtr_t::write()
+				will optimize away writes of unchanged
+				bytes. Failure to write this caused a
+				recovery failure when we avoided
+				reading the undo log page from the
+				data file and initialized it based on
+				redo log records (which included the
+				write of the previous garbage). */
+				mtr.memset(*undo_block, first_free,
+					   srv_page_size - first_free
+					   - FIL_PAGE_DATA_END, 0);
 			}
 
 			mtr_commit(&mtr);
 		} else {
 			/* Success */
-			undo->withdraw_clock = buf_pool.withdraw_clock();
 			mtr_commit(&mtr);
 
 			undo->top_page_no = undo_block->page.id().page_no();
@@ -2174,14 +2201,14 @@ trx_undo_get_undo_rec(
 	const table_name_t&	name,
 	trx_undo_rec_t**	undo_rec)
 {
-	rw_lock_s_lock(&purge_sys.latch);
+	purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 
 	bool missing_history = purge_sys.changes_visible(trx_id, name);
 	if (!missing_history) {
 		*undo_rec = trx_undo_get_undo_rec_low(roll_ptr, heap);
 	}
 
-	rw_lock_s_unlock(&purge_sys.latch);
+	purge_sys.latch.rd_unlock();
 
 	return(missing_history);
 }
@@ -2244,7 +2271,6 @@ trx_undo_prev_version_build(
 	byte*		buf;
 
 	ut_ad(!index->table->is_temporary());
-	ut_ad(!rw_lock_own(&purge_sys.latch, RW_LOCK_S));
 	ut_ad(index_mtr->memo_contains_page_flagged(index_rec,
 						    MTR_MEMO_PAGE_S_FIX
 						    | MTR_MEMO_PAGE_X_FIX));
@@ -2338,14 +2364,12 @@ trx_undo_prev_version_build(
 
 		if ((update->info_bits & REC_INFO_DELETED_FLAG)
 		    && row_upd_changes_disowned_external(update)) {
-			bool	missing_extern;
+			purge_sys.latch.rd_lock(SRW_LOCK_CALL);
 
-			rw_lock_s_lock(&purge_sys.latch);
-
-			missing_extern = purge_sys.changes_visible(
+			bool missing_extern = purge_sys.changes_visible(
 				trx_id,	index->table->name);
 
-			rw_lock_s_unlock(&purge_sys.latch);
+			purge_sys.latch.rd_unlock();
 
 			if (missing_extern) {
 				/* treat as a fresh insert, not to
@@ -2364,7 +2388,11 @@ trx_undo_prev_version_build(
 		/* The page containing the clustered index record
 		corresponding to entry is latched in mtr.  Thus the
 		following call is safe. */
-		row_upd_index_replace_new_col_vals(entry, index, update, heap);
+		if (!row_upd_index_replace_new_col_vals(entry, *index, update,
+							heap)) {
+			ut_a(v_status & TRX_UNDO_PREV_IN_PURGE);
+			return false;
+		}
 
 		/* Get number of externally stored columns in updated record */
 		const ulint n_ext = index->is_primary()
@@ -2424,7 +2452,7 @@ trx_undo_prev_version_build(
 				      == rec_get_nth_field_size(rec, n));
 				ulint l = rec_get_1byte_offs_flag(*old_vers)
 					? (n + 1) : (n + 1) * 2;
-				(*old_vers)[-REC_N_OLD_EXTRA_BYTES - l]
+				*(*old_vers - REC_N_OLD_EXTRA_BYTES - l)
 					&= byte(~REC_1BYTE_SQL_NULL_MASK);
 			}
 		}

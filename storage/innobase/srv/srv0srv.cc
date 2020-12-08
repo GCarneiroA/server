@@ -55,7 +55,6 @@ Created 10/8/1995 Heikki Tuuri
 #include "lock0lock.h"
 #include "log0recv.h"
 #include "mem0mem.h"
-#include "os0proc.h"
 #include "pars0pars.h"
 #include "que0que.h"
 #include "row0mysql.h"
@@ -73,10 +72,9 @@ Created 10/8/1995 Heikki Tuuri
 #include "fil0crypt.h"
 #include "fil0pagecompress.h"
 #include "trx0types.h"
-
+#include <list>
 
 #include <my_service_manager.h>
-
 /* The following is the maximum allowed duration of a lock wait. */
 UNIV_INTERN ulong	srv_fatal_semaphore_wait_threshold =  DEFAULT_SRV_FATAL_SEMAPHORE_TIMEOUT;
 
@@ -188,7 +186,7 @@ tpool::thread_pool* srv_thread_pool;
 
 /** Maximum number of times allowed to conditionally acquire
 mutex before switching to blocking wait on the mutex */
-#define MAX_MUTEX_NOWAIT	20
+#define MAX_MUTEX_NOWAIT	2
 
 /** Check whether the number of failed nonblocking mutex
 acquisition attempts exceeds maximum allowed value. If so,
@@ -344,14 +342,6 @@ my_bool	srv_stats_sample_traditional;
 
 my_bool	srv_use_doublewrite_buf;
 
-/** innodb_doublewrite_batch_size (a debug parameter) specifies the
-number of pages to use in LRU and flush_list batch flushing.
-The rest of the doublewrite buffer is used for single-page flushing. */
-ulong	srv_doublewrite_batch_size = 120;
-
-/** innodb_replication_delay */
-ulong	srv_replication_delay;
-
 /** innodb_sync_spin_loops */
 ulong	srv_n_spin_wait_rounds;
 /** innodb_spin_wait_delay */
@@ -464,16 +454,6 @@ UNIV_INTERN uint srv_simulate_comp_failures;
 /** Buffer pool dump status frequence in percentages */
 UNIV_INTERN ulong srv_buf_dump_status_frequency;
 
-/** Acquire the system_mutex. */
-#define srv_sys_mutex_enter() do {			\
-	mutex_enter(&srv_sys.mutex);			\
-} while (0)
-
-/** Release the system mutex. */
-#define srv_sys_mutex_exit() do {			\
-	mutex_exit(&srv_sys.mutex);			\
-} while (0)
-
 /*
 	IMPLEMENTATION OF THE SERVER MAIN PROGRAM
 	=========================================
@@ -553,8 +533,6 @@ struct srv_sys_t{
 	UT_LIST_BASE_NODE_T(que_thr_t)
 			tasks;			/*!< task queue */
 
-	ib_mutex_t	mutex;			/*!< variable protecting the
-						fields below. */
 	srv_stats_t::ulint_ctr_1_t
 			activity_count;		/*!< For tracking server
 						activity */
@@ -577,8 +555,7 @@ struct purge_coordinator_state
 
 static purge_coordinator_state purge_state;
 
-/** threadpool timer for srv_error_monitor_task(). */
-std::unique_ptr<tpool::timer> srv_error_monitor_timer;
+/** threadpool timer for srv_monitor_task() */
 std::unique_ptr<tpool::timer> srv_monitor_timer;
 
 
@@ -589,16 +566,6 @@ char*	srv_buf_dump_filename;
 and/or load it during startup. */
 char	srv_buffer_pool_dump_at_shutdown = TRUE;
 char	srv_buffer_pool_load_at_startup = TRUE;
-
-/** Slot index in the srv_sys.sys_threads array for the master thread. */
-#define SRV_MASTER_SLOT 0
-
-/** Slot index in the srv_sys.sys_threads array for the purge thread. */
-#define SRV_PURGE_SLOT 1
-
-/** Slot index in the srv_sys.sys_threads array from which purge workers start.
-  */
-#define SRV_WORKER_SLOTS_START 2
 
 #ifdef HAVE_PSI_STAGE_INTERFACE
 /** Performance schema stage event for monitoring ALTER TABLE progress
@@ -729,15 +696,9 @@ static bool need_srv_free;
 static void srv_init()
 {
 	mutex_create(LATCH_ID_SRV_INNODB_MONITOR, &srv_innodb_monitor_mutex);
-	srv_thread_pool_init();
 
 	if (!srv_read_only_mode) {
-		mutex_create(LATCH_ID_SRV_SYS, &srv_sys.mutex);
-
 		mutex_create(LATCH_ID_SRV_SYS_TASKS, &srv_sys.tasks_mutex);
-
-
-		buf_flush_event = os_event_create("buf_flush_event");
 
 		UT_LIST_INIT(srv_sys.tasks, &que_thr_t::queue);
 	}
@@ -746,7 +707,7 @@ static void srv_init()
 	ut_d(srv_master_thread_disabled_event = os_event_create(0));
 
 	/* page_zip_stat_per_index_mutex is acquired from:
-	1. page_zip_compress() (after SYNC_FSP)
+	1. page_zip_compress()
 	2. page_zip_decompress()
 	3. i_s_cmp_per_index_fill_low() (where SYNC_DICT is acquired)
 	4. innodb_cmp_per_index_update(), no other latches
@@ -767,7 +728,6 @@ static void srv_init()
 	/* Initialize some INFORMATION SCHEMA internal structures */
 	trx_i_s_cache_init(trx_i_s_cache);
 
-	ut_crc32_init();
 }
 
 /*********************************************************************//**
@@ -784,9 +744,7 @@ srv_free(void)
 	mutex_free(&page_zip_stat_per_index_mutex);
 
 	if (!srv_read_only_mode) {
-		mutex_free(&srv_sys.mutex);
 		mutex_free(&srv_sys.tasks_mutex);
-		os_event_destroy(buf_flush_event);
 	}
 
 	ut_d(os_event_destroy(srv_master_thread_disabled_event));
@@ -801,6 +759,7 @@ void
 srv_boot(void)
 /*==========*/
 {
+	srv_thread_pool_init();
 	sync_check_init();
 	trx_pool_init();
 	row_mysql_init();
@@ -809,16 +768,11 @@ srv_boot(void)
 
 /******************************************************************//**
 Refreshes the values used to calculate per-second averages. */
-static
-void
-srv_refresh_innodb_monitor_stats(void)
-/*==================================*/
+static void srv_refresh_innodb_monitor_stats(time_t current_time)
 {
 	mutex_enter(&srv_innodb_monitor_mutex);
 
-	time_t current_time = time(NULL);
-
-	if (difftime(current_time, srv_last_monitor_time) <= 60) {
+	if (difftime(current_time, srv_last_monitor_time) < 60) {
 		/* We referesh InnoDB Monitor values so that averages are
 		printed from at most 60 last seconds */
 		mutex_exit(&srv_innodb_monitor_mutex);
@@ -901,7 +855,7 @@ srv_printf_innodb_monitor(
 	      "SEMAPHORES\n"
 	      "----------\n", file);
 
-	sync_print(file);
+	sync_array_print(file);
 
 	/* Conceptually, srv_innodb_monitor_mutex has a very high latching
 	order level in sync0sync.h, while dict_foreign_err_mutex has a very
@@ -964,13 +918,13 @@ srv_printf_innodb_monitor(
 #ifdef BTR_CUR_HASH_ADAPT
 	for (ulint i = 0; i < btr_ahi_parts && btr_search_enabled; ++i) {
 		const auto part= &btr_search_sys.parts[i];
-		rw_lock_s_lock(&part->latch);
+		part->latch.rd_lock(SRW_LOCK_CALL);
 		ut_ad(part->heap->type == MEM_HEAP_FOR_BTR_SEARCH);
 		fprintf(file, "Hash table size " ULINTPF
 			", node heap has " ULINTPF " buffer(s)\n",
 			part->table.n_cells,
 			part->heap->base.count - !part->heap->free_block);
-		rw_lock_s_unlock(&part->latch);
+		part->latch.rd_unlock();
 	}
 
 	fprintf(file,
@@ -1007,12 +961,6 @@ srv_printf_innodb_monitor(
 	fputs("--------------\n"
 	      "ROW OPERATIONS\n"
 	      "--------------\n", file);
-	fprintf(file,
-		ULINTPF " queries inside InnoDB, "
-		ULINTPF " queries in queue\n",
-		srv_conc_get_active_threads(),
-		srv_conc_get_waiting_threads());
-
 	fprintf(file, ULINTPF " read views open inside InnoDB\n",
 		trx_sys.view_count());
 
@@ -1111,14 +1059,14 @@ srv_export_innodb_status(void)
 	ulint mem_adaptive_hash = 0;
 	for (ulong i = 0; i < btr_ahi_parts; i++) {
 		const auto part= &btr_search_sys.parts[i];
-		rw_lock_s_lock(&part->latch);
+		part->latch.rd_lock(SRW_LOCK_CALL);
 		if (part->heap) {
 			ut_ad(part->heap->type == MEM_HEAP_FOR_BTR_SEARCH);
 
 			mem_adaptive_hash += mem_heap_get_size(part->heap)
 				+ part->table.n_cells * sizeof(hash_cell_t);
 		}
-		rw_lock_s_unlock(&part->latch);
+		part->latch.rd_unlock();
 	}
 	export_vars.innodb_mem_adaptive_hash = mem_adaptive_hash;
 #endif
@@ -1155,9 +1103,6 @@ srv_export_innodb_status(void)
 
 	export_vars.innodb_buffer_pool_wait_free =
 		srv_stats.buf_pool_wait_free;
-
-	export_vars.innodb_buffer_pool_pages_flushed =
-		srv_stats.buf_pool_flushed;
 
 	export_vars.innodb_buffer_pool_reads = srv_stats.buf_pool_reads;
 
@@ -1274,8 +1219,6 @@ srv_export_innodb_status(void)
 	export_vars.innodb_system_rows_deleted =
 		srv_stats.n_system_rows_deleted;
 
-	export_vars.innodb_num_open_files = fil_system.n_open;
-
 	export_vars.innodb_truncated_status_writes =
 		srv_truncated_status_writes;
 
@@ -1332,13 +1275,13 @@ srv_export_innodb_status(void)
 
 	mutex_exit(&srv_innodb_monitor_mutex);
 
-	log_mutex_enter();
+	mysql_mutex_lock(&log_sys.mutex);
 	export_vars.innodb_lsn_current = log_sys.get_lsn();
 	export_vars.innodb_lsn_flushed = log_sys.get_flushed_lsn();
 	export_vars.innodb_lsn_last_checkpoint = log_sys.last_checkpoint_lsn;
 	export_vars.innodb_checkpoint_max_age = static_cast<ulint>(
 		log_sys.max_checkpoint_age);
-	log_mutex_exit();
+	mysql_mutex_unlock(&log_sys.mutex);
 
 	export_vars.innodb_checkpoint_age = static_cast<ulint>(
 		export_vars.innodb_lsn_current
@@ -1360,26 +1303,18 @@ struct srv_monitor_state_t
 static srv_monitor_state_t monitor_state;
 
 /** A task which prints the info output by various InnoDB monitors.*/
-void srv_monitor_task(void*)
+static void srv_monitor()
 {
-	double		time_elapsed;
-	time_t		current_time;
+	time_t current_time = time(NULL);
 
-	ut_ad(!srv_read_only_mode);
-
-	current_time = time(NULL);
-
-	time_elapsed = difftime(current_time, monitor_state.last_monitor_time);
-
-	if (time_elapsed > 15) {
+	if (difftime(current_time, monitor_state.last_monitor_time) >= 15) {
 		monitor_state.last_monitor_time = current_time;
 
 		if (srv_print_innodb_monitor) {
 			/* Reset mutex_skipped counter everytime
 			srv_print_innodb_monitor changes. This is to
 			ensure we will not be blocked by lock_sys.mutex
-			for short duration information printing,
-			such as requested by sync_array_print_long_waits() */
+			for short duration information printing */
 			if (!monitor_state.last_srv_print_monitor) {
 				monitor_state.mutex_skipped = 0;
 				monitor_state.last_srv_print_monitor = true;
@@ -1417,14 +1352,14 @@ void srv_monitor_task(void*)
 		}
 	}
 
-	srv_refresh_innodb_monitor_stats();
+	srv_refresh_innodb_monitor_stats(current_time);
 }
 
 /*********************************************************************//**
 A task which prints warnings about semaphore waits which have lasted
 too long. These can be used to track bugs which cause hangs.
 */
-void srv_error_monitor_task(void*)
+void srv_monitor_task(void*)
 {
 	/* number of successive fatal timeouts observed */
 	static ulint		fatal_cnt;
@@ -1459,20 +1394,17 @@ void srv_error_monitor_task(void*)
 	if (sync_array_print_long_waits(&waiter, &sema)
 	    && sema == old_sema && os_thread_eq(waiter, old_waiter)) {
 #if defined(WITH_WSREP) && defined(WITH_INNODB_DISALLOW_WRITES)
-	  if (os_event_is_set(srv_allow_writes_event)) {
+		if (!os_event_is_set(srv_allow_writes_event)) {
+			fprintf(stderr,
+				"WSREP: avoiding InnoDB self crash due to "
+				"long semaphore wait of  > %lu seconds\n"
+				"Server is processing SST donor operation, "
+				"fatal_cnt now: " ULINTPF,
+				srv_fatal_semaphore_wait_threshold, fatal_cnt);
+			return;
+		}
 #endif /* WITH_WSREP */
-		fatal_cnt++;
-#if defined(WITH_WSREP) && defined(WITH_INNODB_DISALLOW_WRITES)
-	  } else {
-		fprintf(stderr,
-			"WSREP: avoiding InnoDB self crash due to long "
-			"semaphore wait of  > %lu seconds\n"
-			"Server is processing SST donor operation, "
-			"fatal_cnt now: " ULINTPF,
-			srv_fatal_semaphore_wait_threshold, fatal_cnt);
-	  }
-#endif /* WITH_WSREP */
-		if (fatal_cnt > 10) {
+		if (fatal_cnt++) {
 			ib::fatal() << "Semaphore wait has lasted > "
 				<< srv_fatal_semaphore_wait_threshold
 				<< " seconds. We intentionally crash the"
@@ -1483,6 +1415,8 @@ void srv_error_monitor_task(void*)
 		old_waiter = waiter;
 		old_sema = sema;
 	}
+
+	srv_monitor();
 }
 
 /******************************************************************//**
@@ -1507,17 +1441,6 @@ bool srv_any_background_activity()
 }
 #endif /* UNIV_DEBUG */
 
-/** Wake up the InnoDB master thread if it was suspended (not sleeping). */
-void
-srv_active_wake_master_thread_low()
-{
-	ut_ad(!srv_read_only_mode);
-	ut_ad(!mutex_own(&srv_sys.mutex));
-
-	srv_inc_activity_count();
-}
-
-
 static void purge_worker_callback(void*);
 static void purge_coordinator_callback(void*);
 static void purge_coordinator_timer_callback(void*);
@@ -1536,7 +1459,6 @@ void
 srv_wake_purge_thread_if_not_active()
 {
 	ut_ad(!srv_read_only_mode);
-	ut_ad(!mutex_own(&srv_sys.mutex));
 
 	if (purge_sys.enabled() && !purge_sys.paused()
 	    && trx_sys.rseg_history_len) {
@@ -1555,13 +1477,13 @@ bool purge_sys_t::running() const
 /** Stop purge during FLUSH TABLES FOR EXPORT */
 void purge_sys_t::stop()
 {
-  rw_lock_x_lock(&latch);
+  latch.wr_lock(SRW_LOCK_CALL);
 
   if (!enabled())
   {
     /* Shutdown must have been initiated during FLUSH TABLES FOR EXPORT. */
     ut_ad(!srv_undo_sources);
-    rw_lock_x_unlock(&latch);
+    latch.wr_unlock();
     return;
   }
 
@@ -1569,7 +1491,7 @@ void purge_sys_t::stop()
 
   const auto paused= m_paused++;
 
-  rw_lock_x_unlock(&latch);
+  latch.wr_unlock();
 
   if (!paused)
   {
@@ -1592,7 +1514,7 @@ void purge_sys_t::resume()
    ut_ad(srv_force_recovery < SRV_FORCE_NO_BACKGROUND);
    ut_ad(!sync_check_iterate(sync_check()));
    purge_coordinator_task.enable();
-   rw_lock_x_lock(&latch);
+   latch.wr_lock(SRW_LOCK_CALL);
    int32_t paused= m_paused--;
    ut_a(paused);
 
@@ -1603,19 +1525,11 @@ void purge_sys_t::resume()
      srv_wake_purge_thread_if_not_active();
      MONITOR_ATOMIC_INC(MONITOR_PURGE_RESUME_COUNT);
    }
-   rw_lock_x_unlock(&latch);
-}
-
-/** Wake up the master thread if it is suspended or being suspended. */
-void
-srv_wake_master_thread()
-{
-	srv_inc_activity_count();
+   latch.wr_unlock();
 }
 
 /*******************************************************************//**
-Get current server activity count. We don't hold srv_sys::mutex while
-reading this value as it is only used in heuristics.
+Get current server activity count.
 @return activity count. */
 ulint
 srv_get_activity_count(void)
@@ -1624,15 +1538,19 @@ srv_get_activity_count(void)
 	return(srv_sys.activity_count);
 }
 
-/*******************************************************************//**
-Check if there has been any activity.
-@return FALSE if no change in activity counter. */
-ibool
-srv_check_activity(
-/*===============*/
-	ulint		old_activity_count)	/*!< in: old activity count */
+/** Check if srv_inc_activity_count() has been called.
+@param activity_count   copy of srv_sys.activity_count
+@return whether the activity_count had changed */
+static bool srv_check_activity(ulint *activity_count)
 {
-	return(srv_sys.activity_count != old_activity_count);
+  ulint new_activity_count= srv_sys.activity_count;
+  if (new_activity_count != *activity_count)
+  {
+    *activity_count= new_activity_count;
+    return true;
+  }
+
+  return false;
 }
 
 /********************************************************************//**
@@ -1823,28 +1741,6 @@ srv_master_do_active_tasks(void)
 		MONITOR_INC_TIME_IN_MICRO_SECS(
 			MONITOR_SRV_DICT_LRU_MICROSECOND, counter_time);
 	}
-
-	/* The periodic log_checkpoint() call here makes it harder to
-	reproduce bugs in crash recovery or mariabackup --prepare, or
-	in code that writes the redo log records. Omitting the call
-	here should not affect correctness, because log_free_check()
-	should still be invoking checkpoints when needed. In a
-	production server, those calls could cause "furious flushing"
-	and stall the server. Normally we want to perform checkpoints
-	early and often to avoid those situations. */
-	DBUG_EXECUTE_IF("ib_log_checkpoint_avoid", return;);
-
-	if (srv_shutdown_state > SRV_SHUTDOWN_INITIATED) {
-		return;
-	}
-
-	/* Make a new checkpoint */
-	if (cur_time % SRV_MASTER_CHECKPOINT_INTERVAL == 0) {
-		srv_main_thread_op_info = "making checkpoint";
-		log_checkpoint();
-		MONITOR_INC_TIME_IN_MICRO_SECS(
-			MONITOR_SRV_CHECKPOINT_MICROSECOND, counter_time);
-	}
 }
 
 /*********************************************************************//**
@@ -1903,26 +1799,6 @@ srv_master_do_idle_tasks(void)
 	srv_sync_log_buffer_in_background();
 	MONITOR_INC_TIME_IN_MICRO_SECS(
 		MONITOR_SRV_LOG_FLUSH_MICROSECOND, counter_time);
-
-	/* The periodic log_checkpoint() call here makes it harder to
-	reproduce bugs in crash recovery or mariabackup --prepare, or
-	in code that writes the redo log records. Omitting the call
-	here should not affect correctness, because log_free_check()
-	should still be invoking checkpoints when needed. In a
-	production server, those calls could cause "furious flushing"
-	and stall the server. Normally we want to perform checkpoints
-	early and often to avoid those situations. */
-	DBUG_EXECUTE_IF("ib_log_checkpoint_avoid", return;);
-
-	if (srv_shutdown_state > SRV_SHUTDOWN_INITIATED) {
-		return;
-	}
-
-	/* Make a new checkpoint */
-	srv_main_thread_op_info = "making checkpoint";
-	log_checkpoint();
-	MONITOR_INC_TIME_IN_MICRO_SECS(MONITOR_SRV_CHECKPOINT_MICROSECOND,
-				       counter_time);
 }
 
 /**
@@ -1971,8 +1847,7 @@ void srv_master_callback(void*)
 
 	srv_main_thread_op_info = "";
 	MONITOR_INC(MONITOR_MASTER_THREAD_SLEEP);
-	if (srv_check_activity(old_activity_count)) {
-		old_activity_count = srv_get_activity_count();
+	if (srv_check_activity(&old_activity_count)) {
 		srv_master_do_active_tasks();
 	} else {
 		srv_master_do_idle_tasks();
@@ -2097,15 +1972,13 @@ static uint32_t srv_do_purge(ulint* n_total_purged)
 				++n_use_threads;
 			}
 
-		} else if (srv_check_activity(old_activity_count)
+		} else if (srv_check_activity(&old_activity_count)
 			   && n_use_threads > 1) {
 
 			/* History length same or smaller since last snapshot,
 			use fewer threads. */
 
 			--n_use_threads;
-
-			old_activity_count = srv_get_activity_count();
 		}
 
 		/* Ensure that the purge threads are less than what
@@ -2132,7 +2005,7 @@ static uint32_t srv_do_purge(ulint* n_total_purged)
 }
 
 
-static std::queue<THD*> purge_thds;
+static std::list<THD*> purge_thds;
 static std::mutex purge_thd_mutex;
 extern void* thd_attach_thd(THD*);
 extern void thd_detach_thd(void *);
@@ -2142,11 +2015,11 @@ THD* acquire_thd(void **ctx)
 	std::unique_lock<std::mutex> lk(purge_thd_mutex);
 	if (purge_thds.empty()) {
 		THD* thd = current_thd;
-		purge_thds.push(innobase_create_background_thd("InnoDB purge worker"));
+		purge_thds.push_back(innobase_create_background_thd("InnoDB purge worker"));
 		set_current_thd(thd);
 	}
 	THD* thd = purge_thds.front();
-	purge_thds.pop();
+	purge_thds.pop_front();
 	lk.unlock();
 
 	/* Set current thd, and thd->mysys_var as well,
@@ -2159,7 +2032,7 @@ void release_thd(THD *thd, void *ctx)
 {
 	thd_detach_thd(ctx);
 	std::unique_lock<std::mutex> lk(purge_thd_mutex);
-	purge_thds.push(thd);
+	purge_thds.push_back(thd);
 	lk.unlock();
 	set_current_thd(0);
 }
@@ -2258,7 +2131,7 @@ static void srv_shutdown_purge_tasks()
   while (!purge_thds.empty())
   {
     innobase_destroy_background_thd(purge_thds.front());
-    purge_thds.pop();
+    purge_thds.pop_front();
   }
 }
 

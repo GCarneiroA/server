@@ -35,7 +35,7 @@ Created 1/8/1996 Heikki Tuuri
 #include "btr0types.h"
 #include "lock0types.h"
 #include "que0types.h"
-#include "sync0rw.h"
+#include "sux_lock.h"
 #include "ut0mem.h"
 #include "ut0rnd.h"
 #include "ut0byte.h"
@@ -52,6 +52,7 @@ Created 1/8/1996 Heikki Tuuri
 #include <algorithm>
 #include <iterator>
 #include <ostream>
+#include <mutex>
 
 /* Forward declaration. */
 struct ib_rbt_t;
@@ -297,22 +298,19 @@ parent table will fail, and user has to drop excessive foreign constraint
 before proceeds. */
 #define FK_MAX_CASCADE_DEL		15
 
-/**********************************************************************//**
-Creates a table memory object.
+/** Create a table memory object.
+@param name     table name
+@param space    tablespace
+@param n_cols   total number of columns (both virtual and non-virtual)
+@param n_v_cols number of virtual columns
+@param flags    table flags
+@param flags2   table flags2
 @return own: table object */
-dict_table_t*
-dict_mem_table_create(
-/*==================*/
-	const char*	name,		/*!< in: table name */
-	fil_space_t*	space,		/*!< in: tablespace */
-	ulint		n_cols,		/*!< in: total number of columns
-					including virtual and non-virtual
-					columns */
-	ulint		n_v_cols,	/*!< in: number of virtual columns */
-	ulint		flags,		/*!< in: table flags */
-	ulint		flags2);	/*!< in: table flags2 */
-/****************************************************************//**
-Free a table memory object. */
+dict_table_t *dict_mem_table_create(const char *name, fil_space_t *space,
+                                    ulint n_cols, ulint n_v_cols, ulint flags,
+                                    ulint flags2);
+/****************************************************************/ /**
+ Free a table memory object. */
 void
 dict_mem_table_free(
 /*================*/
@@ -728,7 +726,7 @@ public:
   bool same_format(const dict_col_t &other) const
   {
     return same_type(other) && len >= other.len &&
-      mbminlen == other.mbminlen && mbmaxlen == other.mbmaxlen &&
+      mbminlen == other.mbminlen && mbmaxlen >= other.mbmaxlen &&
       !((prtype ^ other.prtype) & ~(DATA_NOT_NULL | DATA_VERSIONED |
                                     CHAR_COLL_MASK << 16 |
                                     DATA_LONG_TRUE_VARCHAR));
@@ -766,9 +764,6 @@ struct dict_v_col_t{
 	/** column pos in table */
 	unsigned		v_pos:10;
 
-	/** number of indexes */
-	unsigned		n_v_indexes:12;
-
 	/** Virtual index list, and column position in the index */
 	std::forward_list<dict_v_idx_t, ut_allocator<dict_v_idx_t> >
 	v_indexes;
@@ -777,21 +772,17 @@ struct dict_v_col_t{
   @param index  index to be detached from */
   void detach(const dict_index_t &index)
   {
-    if (!n_v_indexes) return;
+    if (v_indexes.empty()) return;
     auto i= v_indexes.before_begin();
-    ut_d(unsigned n= 0);
     do {
       auto prev = i++;
       if (i == v_indexes.end())
       {
-        ut_ad(n == n_v_indexes);
         return;
       }
-      ut_ad(++n <= n_v_indexes);
       if (i->index == &index)
       {
         v_indexes.erase_after(prev);
-        n_v_indexes--;
         return;
       }
     }
@@ -933,7 +924,9 @@ extern ulong	zip_pad_max;
 an uncompressed page should be left as padding to avoid compression
 failures. This estimate is based on a self-adapting heuristic. */
 struct zip_pad_info_t {
-	SysMutex	mutex;	/*!< mutex protecting the info */
+  /** Dummy assignment operator for dict_index_t::clone() */
+  zip_pad_info_t &operator=(const zip_pad_info_t&) { return *this; }
+	std::mutex	mutex;	/*!< mutex protecting the info */
 	Atomic_relaxed<ulint>
 			pad;	/*!< number of bytes used as pad */
 	ulint		success;/*!< successful compression ops during
@@ -1123,8 +1116,8 @@ public:
 				when InnoDB was started up */
 	zip_pad_info_t	zip_pad;/*!< Information about state of
 				compression failures and successes */
-	rw_lock_t	lock;	/*!< read-write lock protecting the
-				upper levels of the index tree */
+  /** lock protecting the non-leaf index pages */
+  mutable index_lock lock;
 
 	/** Determine if the index has been committed to the
 	data dictionary.
@@ -1448,6 +1441,10 @@ struct dict_foreign_t{
 
 	dict_vcol_set*	v_cols;		/*!< set of virtual columns affected
 					by foreign key constraint. */
+
+	/** Check whether the fulltext index gets affected by
+	foreign key constraint */
+	bool affects_fulltext() const;
 };
 
 std::ostream&
@@ -1807,6 +1804,13 @@ struct dict_table_t {
 		return(UNIV_LIKELY(!file_unreadable));
 	}
 
+	/** @return whether the table is accessible */
+	bool is_accessible() const
+	{
+		return UNIV_LIKELY(is_readable() && !corrupted && space)
+			&& !space->is_stopping();
+	}
+
 	/** Check if a table name contains the string "/#sql"
 	which denotes temporary or intermediate tables in MariaDB. */
 	static bool is_temporary_name(const char* name)
@@ -2131,20 +2135,8 @@ public:
 	/*!< set of foreign key constraints which refer to this table */
 	dict_foreign_set			referenced_set;
 
-	/** Statistics for query optimization. @{ */
-
-	/** This latch protects:
-	dict_table_t::stat_initialized,
-	dict_table_t::stat_n_rows (*),
-	dict_table_t::stat_clustered_index_size,
-	dict_table_t::stat_sum_of_other_index_sizes,
-	dict_table_t::stat_modified_counter (*),
-	dict_table_t::indexes*::stat_n_diff_key_vals[],
-	dict_table_t::indexes*::stat_index_size,
-	dict_table_t::indexes*::stat_n_leaf_pages.
-	(*) Those are not always protected for
-	performance reasons. */
-	rw_lock_t				stats_latch;
+	/** Statistics for query optimization. Mostly protected by
+	dict_sys.mutex. @{ */
 
 	/** TRUE if statistics have been calculated the first time after
 	database startup or table creation. */
@@ -2269,7 +2261,7 @@ public:
 	lock_t*					autoinc_lock;
 
 	/** Mutex protecting the autoincrement counter. */
-	ib_mutex_t				autoinc_mutex;
+	std::mutex				autoinc_mutex;
 
 	/** Autoinc counter value to give to the next inserted row. */
 	ib_uint64_t				autoinc;

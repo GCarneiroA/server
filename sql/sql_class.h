@@ -195,7 +195,14 @@ extern char empty_c_string[1];
 extern MYSQL_PLUGIN_IMPORT const char **errmesg;
 
 extern "C" LEX_STRING * thd_query_string (MYSQL_THD thd);
+extern "C" unsigned long long thd_query_id(const MYSQL_THD thd);
 extern "C" size_t thd_query_safe(MYSQL_THD thd, char *buf, size_t buflen);
+extern "C" const char *thd_user_name(MYSQL_THD thd);
+extern "C" const char *thd_client_host(MYSQL_THD thd);
+extern "C" const char *thd_client_ip(MYSQL_THD thd);
+extern "C" LEX_CSTRING *thd_current_db(MYSQL_THD thd);
+extern "C" int thd_current_status(MYSQL_THD thd);
+extern "C" enum enum_server_command thd_current_command(MYSQL_THD thd);
 
 /**
   @class CSET_STRING
@@ -277,8 +284,9 @@ class Key_part_spec :public Sql_alloc {
 public:
   LEX_CSTRING field_name;
   uint length;
-  Key_part_spec(const LEX_CSTRING *name, uint len)
-    : field_name(*name), length(len)
+  bool generated;
+  Key_part_spec(const LEX_CSTRING *name, uint len, bool gen= false)
+    : field_name(*name), length(len), generated(gen)
   {}
   bool operator==(const Key_part_spec& other) const;
   /**
@@ -922,6 +930,12 @@ typedef struct system_status_var
   ulong lost_connections;
   ulong max_statement_time_exceeded;
   /*
+   Number of times where column info was not
+   sent with prepared statement metadata.
+  */
+  ulong skip_metadata_count;
+
+  /*
     Number of statements sent from the client
   */
   ulong questions;
@@ -940,6 +954,7 @@ typedef struct system_status_var
   ulonglong table_open_cache_hits;
   ulonglong table_open_cache_misses;
   ulonglong table_open_cache_overflows;
+  ulonglong send_metadata_skips;
   double last_query_cost;
   double cpu_time, busy_time;
   uint32 threads_running;
@@ -1099,7 +1114,7 @@ public:
   /* We build without RTTI, so dynamic_cast can't be used. */
   enum Type
   {
-    STATEMENT, PREPARED_STATEMENT, STORED_PROCEDURE
+    STATEMENT, PREPARED_STATEMENT, STORED_PROCEDURE, TABLE_ARENA
   };
 
   Query_arena(MEM_ROOT *mem_root_arg, enum enum_state state_arg) :
@@ -1184,6 +1199,38 @@ public:
 
 
 class Server_side_cursor;
+
+/*
+  Struct to catch changes in column metadata that is sent to client. 
+  in the "result set metadata". Used to support 
+  MARIADB_CLIENT_CACHE_METADATA.
+*/
+struct send_column_info_state
+{
+  /* Last client charset (affects metadata) */
+  CHARSET_INFO *last_charset= nullptr;
+
+  /* Checksum, only used to check changes if 'immutable' is false*/
+  uint32 checksum= 0;
+
+  /*
+    Column info can only be changed by PreparedStatement::reprepare()
+ 
+    There is a class of "weird" prepared statements like SELECT ? or SELECT @a
+    that are not immutable, and depend on input parameters or user variables
+  */
+  bool immutable= false;
+
+  bool initialized= false;
+
+  /*  Used by PreparedStatement::reprepare()*/
+  void reset()
+  {
+    initialized= false;
+    checksum= 0;
+  }
+};
+
 
 /**
   @class Statement
@@ -1274,6 +1321,8 @@ public:
 
   LEX_CSTRING db;
 
+  send_column_info_state column_info_state;
+ 
   /* This is set to 1 of last call to send_result_to_client() was ok */
   my_bool query_cache_is_applicable;
 
@@ -2023,6 +2072,14 @@ struct Ha_data
   */
   plugin_ref lock;
   Ha_data() :ha_ptr(NULL) {}
+
+  void reset()
+  {
+    ha_ptr= nullptr;
+    for (auto &info : ha_info)
+      info.reset();
+    lock= nullptr;
+  }
 };
 
 /**
@@ -2399,7 +2456,10 @@ public:
     rpl_io_thread_info *rpl_io_info;
     rpl_sql_thread_info *rpl_sql_info;
   } system_thread_info;
+  /* Used for BACKUP LOCK */
   MDL_ticket *mdl_backup_ticket, *mdl_backup_lock;
+  /* Used to register that thread has a MDL_BACKUP_WAIT_COMMIT lock */
+  MDL_request *backup_commit_lock;
 
   void reset_for_next_command(bool do_clear_errors= 1);
   /*
@@ -2469,6 +2529,8 @@ public:
 
   /* Last created prepared statement */
   Statement *last_stmt;
+  Statement *cur_stmt= 0;
+
   inline void set_last_stmt(Statement *stmt)
   { last_stmt= (is_error() ? NULL : stmt); }
   inline void clear_last_stmt() { last_stmt= NULL; }
@@ -2846,9 +2908,13 @@ public:
     {
       free_root(&mem_root,MYF(0));
     }
-    my_bool is_active()
+    bool is_active()
     {
       return (all.ha_list != NULL);
+    }
+    bool is_empty()
+    {
+      return all.is_empty() && stmt.is_empty();
     }
     st_transactions()
     {
@@ -3527,7 +3593,7 @@ public:
   void awake_no_mutex(killed_state state_to_set);
   void awake(killed_state state_to_set)
   {
-    bool wsrep_on_local= WSREP_NNULL(this);
+    bool wsrep_on_local= variables.wsrep_on;
     /*
       mutex locking order (LOCK_thd_data - LOCK_thd_kill)) requires
       to grab LOCK_thd_data here
@@ -3571,6 +3637,7 @@ public:
                    char const *query, ulong query_len, bool is_trans,
                    bool direct, bool suppress_use,
                    int errcode);
+  bool binlog_current_query_unfiltered();
 #endif
 
   inline void
@@ -3646,7 +3713,7 @@ public:
   {
     return !MY_TEST(variables.sql_mode & MODE_NO_BACKSLASH_ESCAPES);
   }
-  const Type_handler *type_handler_for_date() const;
+  const Type_handler *type_handler_for_datetime() const;
   bool timestamp_to_TIME(MYSQL_TIME *ltime, my_time_t ts,
                          ulong sec_part, date_mode_t fuzzydate);
   inline my_time_t query_start() { return start_time; }
@@ -3853,10 +3920,17 @@ public:
   /* Commit both statement and full transaction */
   int commit_whole_transaction_and_close_tables();
   void give_protection_error();
+  /*
+    Give an error if any of the following is true for this connection
+    - BACKUP STAGE is active
+    - FLUSH TABLE WITH READ LOCK is active
+    - BACKUP LOCK table_name is active
+  */
   inline bool has_read_only_protection()
   {
     if (current_backup_stage == BACKUP_FINISHED &&
-        !global_read_lock.is_acquired())
+        !global_read_lock.is_acquired() &&
+        !mdl_backup_lock)
       return FALSE;
     give_protection_error();
     return TRUE;
@@ -4029,10 +4103,10 @@ public:
     @param repertoire - the repertoire of the string
   */
   Item_basic_constant *make_string_literal(const char *str, size_t length,
-                                           uint repertoire);
+                                           my_repertoire_t repertoire);
   Item_basic_constant *make_string_literal(const Lex_string_with_metadata_st &str)
   {
-    uint repertoire= str.repertoire(variables.character_set_client);
+    my_repertoire_t repertoire= str.repertoire(variables.character_set_client);
     return make_string_literal(str.str, str.length, repertoire);
   }
   Item_basic_constant *make_string_literal_nchar(const Lex_string_with_metadata_st &str);
@@ -4180,13 +4254,20 @@ public:
     return 0;
   }
 
+
+  bool is_item_tree_change_register_required()
+  {
+    return !stmt_arena->is_conventional()
+           || stmt_arena->type() == Query_arena::TABLE_ARENA;
+  }
+
   void change_item_tree(Item **place, Item *new_value)
   {
     DBUG_ENTER("THD::change_item_tree");
     DBUG_PRINT("enter", ("Register: %p (%p) <- %p",
                        *place, place, new_value));
     /* TODO: check for OOM condition here */
-    if (!stmt_arena->is_conventional())
+    if (is_item_tree_change_register_required())
       nocheck_register_item_tree_change(place, *place, mem_root);
     *place= new_value;
     DBUG_VOID_RETURN;
@@ -4682,14 +4763,13 @@ public:
   void push_warning_truncated_value_for_field(Sql_condition::enum_warning_level
                                               level, const char *type_str,
                                               const char *val,
-                                              const TABLE_SHARE *s,
+                                              const char *db_name,
+                                              const char *table_name,
                                               const char *name)
   {
     DBUG_ASSERT(name);
     char buff[MYSQL_ERRMSG_SIZE];
     CHARSET_INFO *cs= &my_charset_latin1;
-    const char *db_name= s ? s->db.str : NULL;
-    const char *table_name= s ? s->table_name.str : NULL;
 
     if (!db_name)
       db_name= "";
@@ -4706,12 +4786,13 @@ public:
                                              bool totally_useless_value,
                                              const char *type_str,
                                              const char *val,
-                                             const TABLE_SHARE *s,
+                                             const char *db_name,
+                                             const char *table_name,
                                              const char *field_name)
   {
     if (field_name)
       push_warning_truncated_value_for_field(level, type_str, val,
-                                             s, field_name);
+                                             db_name, table_name, field_name);
     else if (totally_useless_value)
       push_warning_wrong_value(level, type_str, val);
     else
@@ -4794,6 +4875,13 @@ public:
     locked_tables_mode= mode_arg;
   }
   void leave_locked_tables_mode();
+  /* Relesae transactional locks if there are no active transactions */
+  void release_transactional_locks()
+  {
+    if (!(server_status &
+          (SERVER_STATUS_IN_TRANS | SERVER_STATUS_IN_TRANS_READONLY)))
+      mdl_context.release_transactional_locks(this);
+  }
   int decide_logging_format(TABLE_LIST *tables);
   /*
    In Some cases when decide_logging_format is called it does not have all
@@ -5108,7 +5196,8 @@ public:
     table updates from being replicated to other nodes via galera replication.
   */
   bool                      wsrep_ignore_table;
-  
+  /* thread who has started kill for this THD protected by LOCK_thd_data*/
+  my_thread_id              wsrep_aborter;
 
   /*
     Transaction id:
@@ -6541,7 +6630,7 @@ struct SORT_FIELD_ATTR
   */
   bool maybe_null;
   CHARSET_INFO *cs;
-  uint pack_sort_string(uchar *to, const LEX_CSTRING &str,
+  uint pack_sort_string(uchar *to, const Binary_string *str,
                         CHARSET_INFO *cs) const;
   int compare_packed_fixed_size_vals(uchar *a, size_t *a_len,
                                      uchar *b, size_t *b_len);
@@ -6549,6 +6638,7 @@ struct SORT_FIELD_ATTR
                                 uchar *b, size_t *b_len);
   bool check_if_packing_possible(THD *thd) const;
   bool is_variable_sized() { return type == VARIABLE_SIZE; }
+  void set_length_and_original_length(THD *thd, uint length_arg);
 };
 
 
@@ -6953,11 +7043,11 @@ public:
 /**
   SP Bulk execution safe
 */
-#define CF_SP_BULK_SAFE (1U << 20)
+#define CF_PS_ARRAY_BINDING_SAFE (1U << 20)
 /**
   SP Bulk execution optimized
 */
-#define CF_SP_BULK_OPTIMIZED (1U << 21)
+#define CF_PS_ARRAY_BINDING_OPTIMIZED (1U << 21)
 /**
   If command creates or drops a table
 */

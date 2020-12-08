@@ -104,7 +104,9 @@ struct ha_field_option_struct
   uint opt;
   const char *dateformat;
   const char *fieldformat;
-  char *special;
+	const char* jsonpath;
+	const char* xmlpath;
+	char *special;
 };
 
 /*
@@ -144,7 +146,7 @@ typedef class ha_connect *PHC;
 /** @brief
   Class definition for the storage engine
 */
-class ha_connect: public handler
+class ha_connect final : public handler
 {
   THR_LOCK_DATA lock;      ///< MySQL lock
   CONNECT_SHARE *share;        ///< Shared lock info

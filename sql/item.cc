@@ -1394,9 +1394,11 @@ bool Item::get_date_from_real(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate
 
 bool Item::get_date_from_string(THD *thd, MYSQL_TIME *to, date_mode_t mode)
 {
-  StringBuffer<40> tmp;
-  Temporal::Warn_push warn(thd, field_table_or_null(), field_name_or_null(),
-                           to, mode);
+  StringBuffer<MAX_DATETIME_FULL_WIDTH+1> tmp;
+  const TABLE_SHARE *s = field_table_or_null();
+  Temporal::Warn_push warn(thd, s ? s->db.str : nullptr,
+                           s ? s->table_name.str : nullptr,
+                           field_name_or_null(), to, mode);
   Temporal_hybrid *t= new(to) Temporal_hybrid(thd, &warn, val_str(&tmp), mode);
   return !t->is_valid_temporal();
 }
@@ -1440,16 +1442,12 @@ int Item::save_in_field_no_warnings(Field *field, bool no_conversions)
   int res;
   TABLE *table= field->table;
   THD *thd= table->in_use;
-  enum_check_fields tmp= thd->count_cuted_fields;
-  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
+  Check_level_instant_set check_level_save(thd, CHECK_FIELD_IGNORE);
   Sql_mode_save sms(thd);
   thd->variables.sql_mode&= ~(MODE_NO_ZERO_IN_DATE | MODE_NO_ZERO_DATE);
   thd->variables.sql_mode|= MODE_INVALID_DATES;
-  thd->count_cuted_fields= CHECK_FIELD_IGNORE;
-
+  my_bitmap_map *old_map= dbug_tmp_use_all_columns(table, table->write_set);
   res= save_in_field(field, no_conversions);
-
-  thd->count_cuted_fields= tmp;
   dbug_tmp_restore_column_map(table->write_set, old_map);
   return res;
 }
@@ -2062,6 +2060,11 @@ bool Item_name_const::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydat
   return rc;
 }
 
+bool Item_name_const::val_native(THD *thd, Native *to)
+{
+  return val_native_from_item(thd, value_item, to);
+}
+
 bool Item_name_const::is_null()
 {
   return value_item->is_null();
@@ -2076,7 +2079,7 @@ Item_name_const::Item_name_const(THD *thd, Item *name_arg, Item *val):
   Item::maybe_null= TRUE;
   if (name_item->basic_const_item() &&
       (name_str= name_item->val_str(&name_buffer))) // Can't have a NULL name
-    set_name(thd, name_str->lex_cstring(), name_str->charset());
+    set_name(thd, name_str);
 }
 
 
@@ -2155,14 +2158,14 @@ public:
                      const LEX_CSTRING &field_name_arg):
     Item_ref(thd, context_arg, item, table_name_arg, field_name_arg) {}
 
-  virtual inline void print (String *str, enum_query_type query_type)
+  void print (String *str, enum_query_type query_type) override
   {
     if (ref)
       (*ref)->print(str, query_type);
     else
       Item_ident::print(str, query_type);
   }
-  virtual Ref_Type ref_type() { return AGGREGATE_REF; }
+  Ref_Type ref_type() override final { return AGGREGATE_REF; }
 };
 
 
@@ -2430,7 +2433,7 @@ bool DTCollation::aggregate(const DTCollation &dt, uint flags)
     {
       if (derivation == DERIVATION_EXPLICIT)
       {
-        set(0, DERIVATION_NONE, 0);
+        set(0, DERIVATION_NONE, MY_REPERTOIRE_NONE);
         return 1;
       }
       if (collation->state & MY_CS_BINSORT &&
@@ -2562,22 +2565,13 @@ bool Type_std_attributes::agg_item_set_converter(const DTCollation &coll,
   bool res= FALSE;
   uint i;
 
-  /*
-    In case we're in statement prepare, create conversion item
-    in its memory: it will be reused on each execute.
-  */
-  Query_arena backup;
-  Query_arena *arena= thd->stmt_arena->is_stmt_prepare() ?
-                      thd->activate_stmt_arena_if_needed(&backup) :
-                      NULL;
+  DBUG_ASSERT(!thd->stmt_arena->is_stmt_prepare());
 
   for (i= 0, arg= args; i < nargs; i++, arg+= item_sep)
   {
     Item* conv= (*arg)->safe_charset_converter(thd, coll.collation);
     if (conv == *arg)
       continue;
-    if (!conv && ((*arg)->collation.repertoire == MY_REPERTOIRE_ASCII))
-      conv= new (thd->mem_root) Item_func_conv_charset(thd, *arg, coll.collation, 1);
 
     if (!conv)
     {
@@ -2591,20 +2585,8 @@ bool Type_std_attributes::agg_item_set_converter(const DTCollation &coll,
       res= TRUE;
       break; // we cannot return here, we need to restore "arena".
     }
-    /*
-      If in statement prepare, then we create a converter for two
-      constant items, do it once and then reuse it.
-      If we're in execution of a prepared statement, arena is NULL,
-      and the conv was created in runtime memory. This can be
-      the case only if the argument is a parameter marker ('?'),
-      because for all true constants the charset converter has already
-      been created in prepare. In this case register the change for
-      rollback.
-    */
-    if (thd->stmt_arena->is_stmt_prepare())
-      *arg= conv;
-    else
-      thd->change_item_tree(arg, conv);
+
+    thd->change_item_tree(arg, conv);
 
     if (conv->fix_fields_if_needed(thd, arg))
     {
@@ -2612,8 +2594,6 @@ bool Type_std_attributes::agg_item_set_converter(const DTCollation &coll,
       break; // we cannot return here, we need to restore "arena".
     }
   }
-  if (arena)
-    thd->restore_active_arena(arena, &backup);
   return res;
 }
 
@@ -3212,6 +3192,12 @@ void Item_ident::print(String *str, enum_query_type query_type)
       use_db_name= use_table_name= false;
   }
 
+  if ((query_type & QT_ITEM_IDENT_DISABLE_DB_TABLE_NAMES))
+  {
+    // Don't print db or table name irrespective of any other settings.
+    use_db_name= use_table_name= false;
+  }
+
   if (!field_name.str || !field_name.str[0])
   {
     append_identifier(thd, str, STRING_WITH_LEN("tmp_field"));
@@ -3325,6 +3311,24 @@ bool Item_field::val_native(THD *thd, Native *to)
 bool Item_field::val_native_result(THD *thd, Native *to)
 {
   return val_native_from_field(result_field, to);
+}
+
+
+longlong Item_field::val_datetime_packed(THD *thd)
+{
+  DBUG_ASSERT(fixed == 1);
+  if ((null_value= field->is_null()))
+    return 0;
+  return field->val_datetime_packed(thd);
+}
+
+
+longlong Item_field::val_time_packed(THD *thd)
+{
+  DBUG_ASSERT(fixed == 1);
+  if ((null_value= field->is_null()))
+    return 0;
+  return field->val_time_packed(thd);
 }
 
 
@@ -3626,9 +3630,10 @@ String *Item_int::val_str(String *str)
 
 void Item_int::print(String *str, enum_query_type query_type)
 {
+  StringBuffer<LONGLONG_BUFFER_SIZE+1> buf;
   // my_charset_bin is good enough for numbers
-  str_value.set_int(value, unsigned_flag, &my_charset_bin);
-  str->append(str_value);
+  buf.set_int(value, unsigned_flag, &my_charset_bin);
+  str->append(buf);
 }
 
 
@@ -3651,21 +3656,6 @@ Item_uint::Item_uint(THD *thd, const char *str_arg, longlong i, uint length):
   Item_int(thd, str_arg, i, length)
 {
   unsigned_flag= 1;
-}
-
-
-String *Item_uint::val_str(String *str)
-{
-  str->set((ulonglong) value, collation.collation);
-  return str;
-}
-
-
-void Item_uint::print(String *str, enum_query_type query_type)
-{
-  // latin1 is good enough for numbers
-  str_value.set((ulonglong) value, default_charset());
-  str->append(str_value);
 }
 
 
@@ -3911,7 +3901,7 @@ Item_null::make_string_literal_concat(THD *thd, const LEX_CSTRING *str)
   if (str->length)
   {
     CHARSET_INFO *cs= thd->variables.collation_connection;
-    uint repertoire= my_string_repertoire(cs, str->str, str->length);
+    my_repertoire_t repertoire= my_string_repertoire(cs, str->str, str->length);
     return new (thd->mem_root) Item_string(thd,
                                            str->str, (uint) str->length, cs,
                                            DERIVATION_COERCIBLE, repertoire);
@@ -4156,7 +4146,7 @@ void Item_param::set_time(MYSQL_TIME *tm, timestamp_type time_type,
   {
     ErrConvTime str(&value.time);
     make_truncated_value_warning(current_thd, Sql_condition::WARN_LEVEL_WARN,
-                                 &str, time_type, 0, 0);
+                                 &str, time_type, NULL, NULL, NULL);
     set_zero_time(&value.time, time_type);
   }
   maybe_null= 0;
@@ -5107,7 +5097,7 @@ static bool mark_as_dependent(THD *thd, SELECT_LEX *last, SELECT_LEX *current,
 
   @note
     We have to mark all items between current_sel (including) and
-    last_select (excluding) as dependend (select before last_select should
+    last_select (excluding) as dependent (select before last_select should
     be marked with actual table mask used by resolved item, all other with
     OUTER_REF_TABLE_BIT) and also write dependence information to Item of
     resolved identifier.
@@ -5481,7 +5471,7 @@ Item_field::fix_outer_field(THD *thd, Field **from_field, Item **reference)
   bool upward_lookup= FALSE;
   TABLE_LIST *table_list;
 
-  /* Calulate the TABLE_LIST for the table */
+  /* Calculate the TABLE_LIST for the table */
   table_list= (cached_table ? cached_table :
                field_found && (*from_field) != view_ref_found ?
                (*from_field)->table->pos_in_table_list : 0);
@@ -6217,7 +6207,7 @@ Item *Item_field::propagate_equal_fields(THD *thd,
       but failed to create a valid DATE literal from the given string literal.
 
       Do not do constant propagation in such cases and unlink
-      "this" from the found Item_equal (as this equality not usefull).
+      "this" from the found Item_equal (as this equality not useful).
     */
     item_equal= NULL;
     return this;
@@ -6688,8 +6678,9 @@ int Item_string::save_in_field(Field *field, bool no_conversions)
 
 Item *Item_string::clone_item(THD *thd)
 {
-  return new (thd->mem_root)
-    Item_string(thd, name, str_value.lex_cstring(), collation.collation);
+  LEX_CSTRING val;
+  str_value.get_value(&val);
+  return new (thd->mem_root) Item_string(thd, name, val, collation.collation);
 }
 
 
@@ -7070,7 +7061,7 @@ void Item_date_literal::print(String *str, enum_query_type query_type)
 {
   str->append("DATE'");
   char buf[MAX_DATE_STRING_REP_LENGTH];
-  my_date_to_str(&cached_time, buf);
+  my_date_to_str(cached_time.get_mysql_time(), buf);
   str->append(buf);
   str->append('\'');
 }
@@ -7085,7 +7076,7 @@ Item *Item_date_literal::clone_item(THD *thd)
 bool Item_date_literal::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
 {
   fuzzydate |= sql_mode_for_dates(thd);
-  *ltime= cached_time;
+  cached_time.copy_to_mysql_time(ltime);
   return (null_value= check_date_with_warn(thd, ltime, fuzzydate,
                                            MYSQL_TIMESTAMP_ERROR));
 }
@@ -7095,7 +7086,7 @@ void Item_datetime_literal::print(String *str, enum_query_type query_type)
 {
   str->append("TIMESTAMP'");
   char buf[MAX_DATE_STRING_REP_LENGTH];
-  my_datetime_to_str(&cached_time, buf, decimals);
+  my_datetime_to_str(cached_time.get_mysql_time(), buf, decimals);
   str->append(buf);
   str->append('\'');
 }
@@ -7110,7 +7101,7 @@ Item *Item_datetime_literal::clone_item(THD *thd)
 bool Item_datetime_literal::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
 {
   fuzzydate |= sql_mode_for_dates(thd);
-  *ltime= cached_time;
+  cached_time.copy_to_mysql_time(ltime);
   return (null_value= check_date_with_warn(thd, ltime, fuzzydate,
                                            MYSQL_TIMESTAMP_ERROR));
 }
@@ -7120,7 +7111,7 @@ void Item_time_literal::print(String *str, enum_query_type query_type)
 {
   str->append("TIME'");
   char buf[MAX_DATE_STRING_REP_LENGTH];
-  my_time_to_str(&cached_time, buf, decimals);
+  my_time_to_str(cached_time.get_mysql_time(), buf, decimals);
   str->append(buf);
   str->append('\'');
 }
@@ -7134,7 +7125,7 @@ Item *Item_time_literal::clone_item(THD *thd)
 
 bool Item_time_literal::get_date(THD *thd, MYSQL_TIME *ltime, date_mode_t fuzzydate)
 {
-  *ltime= cached_time;
+  cached_time.copy_to_mysql_time(ltime);
   if (fuzzydate & TIME_TIME_ONLY)
     return (null_value= false);
   return (null_value= check_date_with_warn(thd, ltime, fuzzydate,
@@ -7569,7 +7560,6 @@ Item *find_producing_item(Item *item, st_select_lex *sel)
   DBUG_ASSERT(item->type() == Item::FIELD_ITEM ||
               (item->type() == Item::REF_ITEM &&
                ((Item_ref *) item)->ref_type() == Item_ref::VIEW_REF)); 
-  Item *producing_item;
   Item_field *field_item= NULL;
   Item_equal *item_equal= item->get_item_equal();
   table_map tab_map= sel->master_unit()->derived->table->map;
@@ -7591,6 +7581,7 @@ Item *find_producing_item(Item *item, st_select_lex *sel)
   List_iterator_fast<Item> li(sel->item_list);
   if (field_item)
   {
+    Item *producing_item= NULL;
     uint field_no= field_item->field->field_index;
     for (uint i= 0; i <= field_no; i++)
       producing_item= li++;
@@ -7938,7 +7929,7 @@ bool Item_ref::fix_fields(THD *thd, Item **reference)
               /*
                 Due to cache, find_field_in_tables() can return field which
                 doesn't belong to provided outer_context. In this case we have
-                to find proper field context in order to fix field correcly.
+                to find proper field context in order to fix field correctly.
               */
               do
               {
@@ -8123,9 +8114,9 @@ Item* Item_ref::transform(THD *thd, Item_transformer transformer, uchar *arg)
   callback functions.
 
   First the function applies the analyzer to the Item_ref object. Then
-  if the analizer succeeeds we first applies the compile method to the
+  if the analyzer succeeds we first apply the compile method to the
   object the Item_ref object is referencing. If this returns a new
-  item the old item is substituted for a new one.  After this the
+  item the old item is substituted for a new one. After this the
   transformer is applied to the Item_ref object itself.
   The compile function is not called if the analyzer returns NULL
   in the parameter arg_p. 
@@ -9993,23 +9984,20 @@ Item *Item_cache_temporal::convert_to_basic_const_item(THD *thd)
 
 Item *Item_cache_datetime::make_literal(THD *thd)
 {
-  MYSQL_TIME ltime;
-  unpack_time(val_datetime_packed(thd), &ltime, MYSQL_TIMESTAMP_DATETIME);
-  return new (thd->mem_root) Item_datetime_literal(thd, &ltime, decimals);
+  Datetime dt(thd, this, TIME_CONV_NONE | TIME_FRAC_NONE);
+  return new (thd->mem_root) Item_datetime_literal(thd, &dt, decimals);
 }
 
 Item *Item_cache_date::make_literal(THD *thd)
 {
-  MYSQL_TIME ltime;
-  unpack_time(val_datetime_packed(thd), &ltime, MYSQL_TIMESTAMP_DATE);
-  return new (thd->mem_root) Item_date_literal(thd, &ltime);
+  Date d(thd, this, TIME_CONV_NONE | TIME_FRAC_NONE);
+  return new (thd->mem_root) Item_date_literal(thd, &d);
 }
 
 Item *Item_cache_time::make_literal(THD *thd)
 {
-  MYSQL_TIME ltime;
-  unpack_time(val_time_packed(thd), &ltime, MYSQL_TIMESTAMP_TIME);
-  return new (thd->mem_root) Item_time_literal(thd, &ltime, decimals);
+  Time t(thd, this);
+  return new (thd->mem_root) Item_time_literal(thd, &t, decimals);
 }
 
 

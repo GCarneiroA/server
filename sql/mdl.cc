@@ -1035,7 +1035,7 @@ void MDL_ticket::destroy(MDL_ticket *ticket)
 
 /**
   Return the 'weight' of this ticket for the
-  victim selection algorithm. Requests with 
+  victim selection algorithm. Requests with
   lower weight are preferred to requests
   with higher weight when choosing a victim.
 */
@@ -2179,7 +2179,7 @@ MDL_context::clone_ticket(MDL_request *mdl_request)
   to wait for another thread which is not ready to commit.
   This is always an error, as the upper level of parallel replication
   should not allow a scheduling of a conflicting DDL until all earlier
-  transactions has commited.
+  transactions have been committed.
 
   This function is only called for a slave using parallel replication
   and trying to get an exclusive lock for the table.
@@ -3039,14 +3039,16 @@ void MDL_context::rollback_to_savepoint(const MDL_savepoint &mdl_savepoint)
   implementation of COMMIT (implicit or explicit) and ROLLBACK.
 */
 
-void MDL_context::release_transactional_locks()
+void MDL_context::release_transactional_locks(THD *thd)
 {
   DBUG_ENTER("MDL_context::release_transactional_locks");
+  /* Fail if there are active transactions */
+  DBUG_ASSERT(!(thd->server_status &
+                (SERVER_STATUS_IN_TRANS | SERVER_STATUS_IN_TRANS_READONLY)));
   release_locks_stored_before(MDL_STATEMENT, NULL);
   release_locks_stored_before(MDL_TRANSACTION, NULL);
   DBUG_VOID_RETURN;
 }
-
 
 void MDL_context::release_statement_locks()
 {
